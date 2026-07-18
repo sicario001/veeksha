@@ -16,11 +16,30 @@ from veeksha.types import ChannelModality
 @dataclass
 class _Chan:
     metrics: Dict[str, Any]
+    content: Any = None
 
 
 @dataclass
 class _Resp:
     channels: Dict[ChannelModality, _Chan]
+
+
+def _tts_aggregate_response(ttfc_ms, e2e_ms, audio_bytes, sample_rate, raw_pcm=True):
+    """Mimics the HTTP TTSClient output: aggregate metrics + raw audio content."""
+    return _Resp(
+        channels={
+            ChannelModality.AUDIO: _Chan(
+                content=audio_bytes,
+                metrics={
+                    ac.AUDIO_TASK: "tts",
+                    ac.AudioMetricKey.TTFC: ttfc_ms,
+                    ac.END_TO_END_LATENCY: e2e_ms,
+                    ac.SAMPLE_RATE: sample_rate,
+                    ac.AudioMetricKey.RAW_PCM: raw_pcm,
+                },
+            )
+        }
+    )
 
 
 def _audio_response(timeline, sample_rate=ac.DEFAULT_AUDIO_SAMPLE_RATE):
@@ -75,3 +94,27 @@ def test_empty_audio_is_safe():
     ev.record_request_completed(1, 1, 1.0, _audio_response([]))
     result = ev.finalize()
     assert result.metrics["num_completed_requests"] == 0
+
+
+def test_tts_aggregate_dialect_from_http_client():
+    # The HTTP TTSClient emits TTFC + end_to_end_latency (ms) + raw audio bytes,
+    # no per-chunk timeline. 24kHz -> 48000 bytes/sec; 24000 bytes = 0.5s audio.
+    sr = ac.DEFAULT_AUDIO_SAMPLE_RATE
+    audio = b"\x00" * 24000  # 0.5s of PCM
+    ev = AudioPerformanceEvaluator(PerformanceEvaluatorConfig())
+    ev.register_request(1, 1, 0.0, None)
+    ev.record_request_completed(
+        1,
+        1,
+        1.0,
+        _tts_aggregate_response(
+            ttfc_ms=80.0, e2e_ms=600.0, audio_bytes=audio, sample_rate=sr
+        ),
+    )
+    m = ev.finalize().metrics
+    assert m["num_completed_requests"] == 1
+    assert math.isclose(m["Time to First Audio (Mean)"], 0.08, rel_tol=1e-6)  # 80ms
+    assert math.isclose(m["End to End Latency (Mean)"], 0.6, rel_tol=1e-6)  # 600ms
+    assert math.isclose(m["Generated Audio Duration (Mean)"], 0.5, rel_tol=1e-6)
+    # RTF = 0.6 / 0.5 = 1.2 (slower than real time)
+    assert math.isclose(m["Real Time Factor (Mean)"], 1.2, rel_tol=1e-6)

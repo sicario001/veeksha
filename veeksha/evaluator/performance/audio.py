@@ -77,23 +77,15 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
         if channel is None:
             return
         metrics = channel.metrics or {}
-        stream = self._build_stream(metrics)
-        if stream is None or len(stream) == 0:
+        derived = self._compute_metrics(channel, metrics)  # all in seconds
+        if derived is None:
             return
 
         # lock-free sketch puts (sharded)
-        ttfa = stream.time_to_first_event()
-        e2e = stream.end_to_end()
-        duration = stream.produced_content_duration_s()
-        rtf = stream.real_time_factor()
-        if ttfa is not None:
-            self.summaries["ttfa"].put(ttfa)
-        if e2e is not None:
-            self.summaries["end_to_end_latency"].put(e2e)
-        if duration is not None:
-            self.summaries["generated_audio_duration"].put(duration)
-        if rtf is not None:
-            self.summaries["rtf"].put(rtf)
+        for key in ("ttfa", "end_to_end_latency", "generated_audio_duration", "rtf"):
+            value = derived.get(key)
+            if value is not None:
+                self.summaries[key].put(value)
         with self._lock:
             self._num_completed += 1
 
@@ -118,29 +110,54 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
         )
 
     # ---- helpers ------------------------------------------------------------
-    def _build_stream(self, metrics: Dict[str, Any]) -> Optional[TimedEventStream]:
+    def _compute_metrics(
+        self, channel: Any, metrics: Dict[str, Any]
+    ) -> Optional[Dict[str, float]]:
+        """Return {ttfa, end_to_end_latency, generated_audio_duration, rtf} in seconds.
+
+        Two dialects: a realtime per-chunk timeline (offsets in ms), or the HTTP
+        aggregate (TTFC + end_to_end_latency in ms + total audio bytes).
+        """
         sample_rate = int(metrics.get(ac.SAMPLE_RATE, ac.DEFAULT_AUDIO_SAMPLE_RATE))
 
         def bytes_to_seconds(n_bytes: int) -> float:
             return ac.pcm_bytes_to_duration_s(n_bytes, sample_rate)
 
-        timeline = metrics.get(ac.AUDIO_CHUNK_TIMESTAMPS)
-        if timeline:
+        # Realtime dialect: a per-chunk timeline (key present, even if empty).
+        if ac.AUDIO_CHUNK_TIMESTAMPS in metrics:
+            timeline = metrics.get(ac.AUDIO_CHUNK_TIMESTAMPS) or []
             events: List[StreamEvent] = [
                 StreamEvent(offset_s=float(offset_ms) / 1000.0, size=int(n_bytes))
                 for offset_ms, n_bytes in timeline
             ]
-            return TimedEventStream(
+            stream = TimedEventStream(
                 ChannelModality.AUDIO, events, unit_duration_fn=bytes_to_seconds
             )
+            if len(stream) == 0:
+                return None
+            return {
+                "ttfa": stream.time_to_first_event(),
+                "end_to_end_latency": stream.end_to_end(),
+                "generated_audio_duration": stream.produced_content_duration_s(),
+                "rtf": stream.real_time_factor(),
+            }
 
-        # Aggregate fallback (HTTP-streaming dialect: total bytes + e2e, no timeline)
-        pcm_bytes = metrics.get(ac.PCM_BYTE_COUNT)
-        e2e = metrics.get(ac.END_TO_END_LATENCY)
-        if pcm_bytes and e2e is not None:
-            return TimedEventStream(
-                ChannelModality.AUDIO,
-                [StreamEvent(offset_s=float(e2e), size=int(pcm_bytes))],
-                unit_duration_fn=bytes_to_seconds,
-            )
-        return None
+        # Aggregate (HTTP dialect): TTFC + end_to_end_latency in ms + audio bytes.
+        e2e_ms = metrics.get(ac.END_TO_END_LATENCY)
+        byte_count = metrics.get(ac.PCM_BYTE_COUNT)
+        content = getattr(channel, "content", None)
+        if byte_count is None and isinstance(content, (bytes, bytearray)):
+            byte_count = len(content)
+            if not metrics.get(ac.AudioMetricKey.RAW_PCM, True):  # WAV -> drop header
+                byte_count = max(0, byte_count - ac.WAV_HEADER_BYTES)
+        if e2e_ms is None or not byte_count:
+            return None
+        duration = bytes_to_seconds(int(byte_count))
+        e2e_s = float(e2e_ms) / 1000.0
+        ttfc_ms = metrics.get(ac.AudioMetricKey.TTFC)
+        return {
+            "ttfa": (float(ttfc_ms) / 1000.0) if ttfc_ms is not None else None,
+            "end_to_end_latency": e2e_s,
+            "generated_audio_duration": duration,
+            "rtf": (e2e_s / duration) if duration else None,
+        }
