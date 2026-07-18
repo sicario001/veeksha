@@ -56,3 +56,14 @@ def test_text_pacing_validation():
         TextPacingConfig(tokens_per_second=0)
     with pytest.raises(ValueError):
         TextPacingConfig(gap_distribution="bogus")
+
+
+def test_audio_configs_expose_build_tokenizer_provider():
+    # benchmark.py branches on this: audio clients bring their own tokenizer,
+    # text clients fall back to the HF tokenizer for the model.
+    from veeksha.config.client import OpenAIChatCompletionsClientConfig
+
+    assert hasattr(TTSClientConfig(), "build_tokenizer_provider")
+    assert hasattr(STTClientConfig(), "build_tokenizer_provider")
+    assert hasattr(RealtimeTTSClientConfig(), "build_tokenizer_provider")
+    assert not hasattr(OpenAIChatCompletionsClientConfig(), "build_tokenizer_provider")
