@@ -1,14 +1,17 @@
-"""Audio measurement contract — PCM constants + metric-key vocabulary.
+"""Audio measurement contract: PCM constants and the metric-key vocabulary.
 
-Pure measurement facts shared by audio clients and the audio evaluator (ported
-from the voice branches so the eventual merge lines up). 16-bit mono PCM is the
-baseline; durations derive from byte counts.
+Pure measurement facts shared by the audio (TTS / realtime / STT) clients and the
+audio evaluators. Transport-specific protocol handling lives in the clients.
+Ported from the voice branches; `AudioMetricKey` is the canonical vocabulary.
 """
 
 from __future__ import annotations
 
+from enum import StrEnum
+
+# 16-bit mono PCM at 24 kHz is the shared baseline across TTS dialects.
 DEFAULT_AUDIO_SAMPLE_RATE = 24000
-BYTES_PER_SAMPLE = 2  # 16-bit mono
+BYTES_PER_SAMPLE = 2
 WAV_HEADER_BYTES = 44
 
 
@@ -23,13 +26,64 @@ def pcm_bytes_to_duration_s(
 def pcm_bytes_to_duration_ms(
     n_bytes: float, sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE
 ) -> float:
+    """Duration in ms of ``n_bytes`` of 16-bit mono PCM at ``sample_rate``."""
     return pcm_bytes_to_duration_s(n_bytes, sample_rate) * 1000.0
 
 
-# Keys the audio channel puts in ChannelResponse.metrics (subset of the branch
-# AudioMetricKey vocabulary, enough for the timing metrics).
-AUDIO_CHUNK_TIMESTAMPS = "audio_chunk_timestamps"  # list[[offset_ms, n_bytes]]
-SAMPLE_RATE = "sample_rate"
-PCM_BYTE_COUNT = "pcm_byte_count"
-END_TO_END_LATENCY = "end_to_end_latency"  # seconds
-AUDIO_TASK = "audio_task"  # "tts" | "stt" (informational)
+class AudioMetricKey(StrEnum):
+    TTFC = "ttfc"
+    END_TO_END_LATENCY = "end_to_end_latency"
+    GENERATED_AUDIO_DURATION = "generated_audio_duration"
+    RTF = "rtf"
+    CHUNK_COUNT = "chunk_count"
+    RAW_PCM = "raw_pcm"
+    SAMPLE_RATE = "sample_rate"
+    PCM_BYTE_COUNT = "pcm_byte_count"
+    INPUT_CHARS = "input_chars"
+    INPUT_TOKENS = "input_tokens"
+    INPUT_TEXT = "input_text"
+    SESSION_SIZE = "session_size"
+    SESSION_DURATION = "session_duration"
+
+    # ----- Realtime input-streaming interactivity keys -----
+    # Time convention for all realtime event-time values below: every *_offset_ms
+    # / timestamp value is a float millisecond offset relative to request start
+    # (the client's WS-connect initiation), measured with time.monotonic().
+    #
+    # Raw-contract keys are emitted by the websocket client:
+    TEXT_DELTA_TIMESTAMPS = "text_delta_timestamps"  # list[[offset_ms, n_chars]]
+    AUDIO_CHUNK_TIMESTAMPS = (
+        "audio_chunk_timestamps"  # list[[offset_ms, n_bytes_decoded_pcm]]
+    )
+    WS_CONNECT_LATENCY_MS = "ws_connect_latency_ms"
+    SESSION_READY_OFFSET_MS = "session_ready_offset_ms"  # nullable
+    RESPONSE_CREATED_OFFSET_MS = "response_created_offset_ms"  # nullable
+    INPUT_COMMIT_OFFSET_MS = "input_commit_offset_ms"
+    AUDIO_DONE_OFFSET_MS = "audio_done_offset_ms"  # nullable
+    RESPONSE_DONE_OFFSET_MS = "response_done_offset_ms"  # nullable
+
+    # Stable request-level interactivity keys emitted by the evaluator.
+    FIRST_INPUT_TO_FIRST_AUDIO_MS = "first_input_to_first_audio_ms"
+    REQUEST_START_TO_FIRST_AUDIO_MS = "request_start_to_first_audio_ms"
+    AUDIO_BEFORE_COMMIT_RATIO = "audio_before_commit_ratio"
+    POST_COMMIT_AUDIO_DELIVERY_MS = "post_commit_audio_delivery_ms"
+    REQUIRED_STARTUP_DELAY_MS = "required_startup_delay_ms"
+    ZERO_DELAY_STALL_COUNT = "zero_delay_stall_count"
+    ZERO_DELAY_TOTAL_STALL_MS = "zero_delay_total_stall_ms"
+    ZERO_DELAY_LONGEST_STALL_MS = "zero_delay_longest_stall_ms"
+    ZERO_DELAY_STALL_FREE = "zero_delay_stall_free"
+
+    # Diagnostic delivery/finalization metrics.
+    STREAMING_RTF = "streaming_rtf"
+    DONE_AFTER_LAST_AUDIO_MS = "done_after_last_audio_ms"
+
+
+# Convenience module-level aliases (the keys the timing evaluator reads). These
+# are the StrEnum members, usable interchangeably with their string values as
+# dict keys.
+AUDIO_CHUNK_TIMESTAMPS = AudioMetricKey.AUDIO_CHUNK_TIMESTAMPS
+SAMPLE_RATE = AudioMetricKey.SAMPLE_RATE
+PCM_BYTE_COUNT = AudioMetricKey.PCM_BYTE_COUNT
+END_TO_END_LATENCY = AudioMetricKey.END_TO_END_LATENCY
+# Task tag the audio clients set in ChannelResponse.metrics (not a metric value).
+AUDIO_TASK = "audio_task"
