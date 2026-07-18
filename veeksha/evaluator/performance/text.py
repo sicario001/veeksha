@@ -15,6 +15,8 @@ from veeksha.config.evaluator import (
 )
 from veeksha.evaluator.base import EvaluationResult
 from veeksha.evaluator.cdf_sketch import CDFSketch
+from veeksha.evaluator.performance.channel_base import BaseChannelPerformanceEvaluator
+from veeksha.evaluator.sharded_sketch import ShardedCDFSketch
 from veeksha.evaluator.chrome_trace import generate_chrome_trace
 from veeksha.logger import init_logger
 from veeksha.types import ChannelModality
@@ -82,7 +84,7 @@ class TextRequestMetrics:
         return self.num_output_tokens / self.end_to_end_latency
 
 
-class TextPerformanceEvaluator:
+class TextPerformanceEvaluator(BaseChannelPerformanceEvaluator):
     """Performance evaluator for text generation (implements legacy MetricStore)
 
     - CDFSketch-based metric aggregation
@@ -112,7 +114,7 @@ class TextPerformanceEvaluator:
         )  # request_id -> dispatch info
 
         # aggregate metrics
-        self.summaries: Dict[str, CDFSketch] = {
+        self.summaries: Dict[str, Any] = {
             "num_prompt_tokens": CDFSketch(
                 metric_name="Number of Prompt Tokens",
             ),
@@ -170,6 +172,18 @@ class TextPerformanceEvaluator:
             "normalized_end_to_end_latency",
             "output_throughput",
         }
+
+        # Request-level sketches are written per-completion across worker threads;
+        # make them lock-free (sharded) so completion processing scales on
+        # free-threaded Python. Session sketches keep the plain CDFSketch (written
+        # under the light lock). See veeksha/evaluator/sharded_sketch.py.
+        for _key in self._request_level_summary_keys:
+            _c = self.summaries[_key]
+            self.summaries[_key] = ShardedCDFSketch(
+                _c.metric_name,
+                should_write_to_wandb=_c.should_write_to_wandb,
+                unit=_c.unit,
+            )
 
         self.request_dispatched_at: List[float] = []
         self.completed_at: List[float] = []
@@ -239,57 +253,68 @@ class TextPerformanceEvaluator:
         completed_at: float,
         response: Any,
     ) -> None:
-        """Record that a text request completed."""
+        """Record that a text request completed.
+
+        The expensive per-chunk work (sketch inserts in ``_update_summaries``)
+        runs lock-free via sharded sketches so completion-worker threads scale on
+        free-threaded Python. Only the cheap shared state — the pending-request
+        map, per-session think-time, and the parallel request-row store (whose
+        appends must stay index-aligned) — is taken under ``self.lock``.
+        """
         with self.lock:
-            # get dispatch info
             dispatch_info = self._pending_requests.pop(request_id, None)
-            if dispatch_info is None:
-                logger.warning(f"Request {request_id} completed but was not registered")
-                return
+        if dispatch_info is None:
+            logger.warning(f"Request {request_id} completed but was not registered")
+            return
 
-            dispatched_at = dispatch_info["dispatched_at"]
-            target_output_tokens = dispatch_info.get("target_output_tokens")
-            target_prompt_tokens = dispatch_info.get("target_prompt_tokens")
+        dispatched_at = dispatch_info["dispatched_at"]
+        target_output_tokens = dispatch_info.get("target_output_tokens")
+        target_prompt_tokens = dispatch_info.get("target_prompt_tokens")
 
-            # Extract metrics from the text channel response
-            channel_response = response.channels.get(ChannelModality.TEXT)
+        # Extract metrics from the text channel response (pure, no shared state)
+        channel_response = response.channels.get(ChannelModality.TEXT)
 
-            if channel_response is not None:
-                channel_metrics = channel_response.metrics or {}
-                num_total_prompt_tokens = channel_metrics.get("num_total_prompt_tokens")
-                num_delta_prompt_tokens = channel_metrics.get("num_delta_prompt_tokens")
-                num_prompt_tokens = num_delta_prompt_tokens or 0
-                num_output_tokens = channel_metrics.get("num_output_tokens", 0)
-                inter_chunk_times = channel_metrics.get("inter_chunk_times", [])
-                is_stream_val = channel_metrics.get("is_stream")
-                request_is_stream = bool(is_stream_val)
-            else:
-                num_prompt_tokens = 0
-                num_output_tokens = 0
-                inter_chunk_times = []
-                num_delta_prompt_tokens = None
-                num_total_prompt_tokens = None
-                request_is_stream = False
+        if channel_response is not None:
+            channel_metrics = channel_response.metrics or {}
+            num_total_prompt_tokens = channel_metrics.get("num_total_prompt_tokens")
+            num_delta_prompt_tokens = channel_metrics.get("num_delta_prompt_tokens")
+            num_prompt_tokens = num_delta_prompt_tokens or 0
+            num_output_tokens = channel_metrics.get("num_output_tokens", 0)
+            inter_chunk_times = channel_metrics.get("inter_chunk_times", [])
+            is_stream_val = channel_metrics.get("is_stream")
+            request_is_stream = bool(is_stream_val)
+        else:
+            num_prompt_tokens = 0
+            num_output_tokens = 0
+            inter_chunk_times = []
+            num_delta_prompt_tokens = None
+            num_total_prompt_tokens = None
+            request_is_stream = False
 
-            session_total_requests = getattr(response, "session_total_requests", None)
+        session_total_requests = getattr(response, "session_total_requests", None)
 
-            # Create metrics object
-            metrics = TextRequestMetrics(
-                request_id=request_id,
-                session_id=session_id,
-                request_dispatched_at=dispatched_at,
-                client_completed_at=completed_at,
-                num_prompt_tokens=num_prompt_tokens,
-                num_output_tokens=num_output_tokens,
-                inter_chunk_times=inter_chunk_times,
-                is_stream=bool(request_is_stream),
-                num_requested_output_tokens=target_output_tokens,
-                session_total_requests=session_total_requests,
-                num_delta_prompt_tokens=num_delta_prompt_tokens,
-                num_total_prompt_tokens=num_total_prompt_tokens,
-                target_num_delta_prompt_tokens=target_prompt_tokens,
-            )
+        # Create metrics object (pure)
+        metrics = TextRequestMetrics(
+            request_id=request_id,
+            session_id=session_id,
+            request_dispatched_at=dispatched_at,
+            client_completed_at=completed_at,
+            num_prompt_tokens=num_prompt_tokens,
+            num_output_tokens=num_output_tokens,
+            inter_chunk_times=inter_chunk_times,
+            is_stream=bool(request_is_stream),
+            num_requested_output_tokens=target_output_tokens,
+            session_total_requests=session_total_requests,
+            num_delta_prompt_tokens=num_delta_prompt_tokens,
+            num_total_prompt_tokens=num_total_prompt_tokens,
+            target_num_delta_prompt_tokens=target_prompt_tokens,
+        )
 
+        # Update request-level CDF sketches — lock-free (sharded).
+        self._update_summaries(metrics)
+
+        # Shared state: session think-time + the parallel row store, under lock.
+        with self.lock:
             prev_completion = self._session_last_completion.get(session_id)
             if prev_completion is not None:
                 think_time = dispatched_at - prev_completion
@@ -297,10 +322,7 @@ class TextPerformanceEvaluator:
                     self.summaries["session_think_time"].put(think_time)
             self._session_last_completion[session_id] = completed_at
 
-            # Update CDF sketches
-            self._update_summaries(metrics)
-
-            # Store request-level metrics (including lifecycle timestamps from response)
+            # Store request-level metrics (incl. lifecycle timestamps from response)
             self._store_request_metrics(metrics, dispatched_at, response)
 
     def _update_summaries(self, metrics: TextRequestMetrics) -> None:

@@ -204,7 +204,14 @@ class PerformanceEvaluator(BaseEvaluator):
         response: Any,
         error: Optional[Exception] = None,
     ) -> None:
-        """Record that a request completed."""
+        """Record that a request completed.
+
+        Only the cheap aggregate bookkeeping (session tracking, counters) is taken
+        under ``self.lock``. The expensive channel-evaluator delegation runs
+        *outside* the lock — each channel evaluator is internally thread-safe (its
+        hot path is lock-free via sharded sketches) — so completion-worker threads
+        process results in parallel instead of serializing on one lock.
+        """
         with self.lock:
             self.end_time = completed_at
 
@@ -232,14 +239,14 @@ class PerformanceEvaluator(BaseEvaluator):
 
             self.num_completed_requests += 1
 
-            # Delegate to channel evaluators
-            for channel, evaluator in self._channel_evaluators.items():
-                evaluator.record_request_completed(
-                    request_id=request_id,
-                    session_id=session_id,
-                    completed_at=completed_at,
-                    response=response,
-                )
+        # Delegate to channel evaluators outside the lock (they self-synchronize).
+        for channel, evaluator in self._channel_evaluators.items():
+            evaluator.record_request_completed(
+                request_id=request_id,
+                session_id=session_id,
+                completed_at=completed_at,
+                response=response,
+            )
 
         if self.config.stream_metrics and self._stream_thread:
             self._stream_has_updates.set()
