@@ -15,8 +15,8 @@ from veeksha.evaluator.performance.text import TextPerformanceEvaluator
 from veeksha.evaluator.performance.video import VideoPerformanceEvaluator
 from veeksha.types import ChannelModality
 
+# Audio now has a real timing-metric implementation; image/video remain stubs.
 STUBS = [
-    (AudioPerformanceEvaluator, ChannelModality.AUDIO),
     (ImagePerformanceEvaluator, ChannelModality.IMAGE),
     (VideoPerformanceEvaluator, ChannelModality.VIDEO),
 ]
