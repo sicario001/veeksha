@@ -60,3 +60,16 @@ def test_empty_stream_is_safe():
     assert s.inter_event_deltas() == []
     assert s.mean_inter_event() is None
     assert s.time_per_unit() is None
+    assert s.streaming_real_time_factor() is None
+
+
+def test_streaming_rtf():
+    # 10 chunks, 4800 bytes each (0.1s @24kHz), arriving every 50ms.
+    def bytes_to_seconds(n_bytes: int) -> float:
+        return n_bytes / 48000.0
+
+    events = [StreamEvent(offset_s=0.05 * i, size=4800) for i in range(1, 11)]
+    s = TimedEventStream(ChannelModality.AUDIO, events, bytes_to_seconds)
+    # wall span first->last = 0.45s; delivered after first = 1.0 - 0.1 = 0.9s
+    # streaming_rtf = 0.45 / 0.9 = 0.5
+    assert math.isclose(s.streaming_real_time_factor(), 0.5, rel_tol=1e-9)

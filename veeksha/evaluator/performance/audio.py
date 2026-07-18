@@ -48,6 +48,7 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
                 "Generated Audio Duration", unit="s"
             ),
             "end_to_end_latency": ShardedCDFSketch("End to End Latency", unit="s"),
+            "streaming_rtf": ShardedCDFSketch("Streaming Real Time Factor"),
             "session_size": ShardedCDFSketch("Requests per Session"),
         }
 
@@ -82,7 +83,13 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
             return
 
         # lock-free sketch puts (sharded)
-        for key in ("ttfa", "end_to_end_latency", "generated_audio_duration", "rtf"):
+        for key in (
+            "ttfa",
+            "end_to_end_latency",
+            "generated_audio_duration",
+            "rtf",
+            "streaming_rtf",
+        ):
             value = derived.get(key)
             if value is not None:
                 self.summaries[key].put(value)
@@ -140,6 +147,7 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
                 "end_to_end_latency": stream.end_to_end(),
                 "generated_audio_duration": stream.produced_content_duration_s(),
                 "rtf": stream.real_time_factor(),
+                "streaming_rtf": stream.streaming_real_time_factor(),
             }
 
         # Aggregate (HTTP dialect): TTFC + end_to_end_latency in ms + audio bytes.

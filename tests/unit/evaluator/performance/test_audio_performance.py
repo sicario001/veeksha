@@ -87,6 +87,10 @@ def test_ttfa_rtf_duration_from_timeline():
     assert math.isclose(result.metrics["End to End Latency (Mean)"], 0.5, rel_tol=1e-6)
     # RTF = e2e / audio_duration = 0.5 / 1.0 = 0.5  (faster than real time)
     assert math.isclose(result.metrics["Real Time Factor (Mean)"], 0.5, rel_tol=1e-6)
+    # streaming RTF = wall(0.45) / delivered-after-first(0.9) = 0.5
+    assert math.isclose(
+        result.metrics["Streaming Real Time Factor (Mean)"], 0.5, rel_tol=1e-6
+    )
 
 
 def test_empty_audio_is_safe():

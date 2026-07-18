@@ -127,3 +127,19 @@ class TimedEventStream:
         if ttf is None or e2e is None or n is None or n <= 1:
             return None
         return (e2e - ttf) / (n - 1)
+
+    def streaming_real_time_factor(self) -> Optional[float]:
+        """Streaming RTF — wall span (first→last event) / content delivered *after*
+        the first event. <1 means the stream kept ahead of real time. Needs a
+        per-event timeline (undefined for a single aggregate event)."""
+        if len(self.events) < 2:
+            return None
+        wall_span = self.events[-1].offset_s - self.events[0].offset_s
+        total = self.produced_content_duration_s()
+        first = self.unit_duration_fn(self.events[0].size)
+        if total is None or first is None:
+            return None
+        delivered_after_first = total - first
+        if delivered_after_first <= 0:
+            return None
+        return wall_span / delivered_after_first
