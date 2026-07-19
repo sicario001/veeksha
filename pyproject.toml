@@ -40,6 +40,9 @@ dependencies = [
     "nvidia-ml-py",
     "rich",
     "vidhi",
+    "websockets",
+    "jiwer",
+    "librosa",
 ]
 
 [project.scripts]

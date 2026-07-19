@@ -40,3 +40,11 @@ ClientRegistry.register(
         "TTSClient",
     ),
 )
+
+ClientRegistry.register(
+    ClientType.STT,
+    _LazyLoader(
+        "veeksha.client.stt",
+        "STTClient",
+    ),
+)
