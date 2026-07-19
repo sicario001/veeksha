@@ -43,6 +43,7 @@ dependencies = [
     "websockets",
     "jiwer",
     "librosa",
+    "regex",
 ]
 
 [project.scripts]
