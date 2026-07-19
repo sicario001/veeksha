@@ -50,9 +50,11 @@ def test_report_fails_when_any_check_fails():
 
 # ------------------------------------------------------------------ pacing probe
 def test_probe_pacing_is_realtime_at_low_concurrency():
-    # a 0.5s clip paced at low concurrency should take ~0.5s (ratio ~1.0)
-    ratio = probe_pacing(concurrency=4, clip_s=0.5, chunk_ms=20.0)
-    assert ratio < 1.15
+    # a 0.5s clip paced at low concurrency should take ~0.5s AND each chunk
+    # should be dispatched on time (small per-chunk send drift).
+    r = probe_pacing(concurrency=4, clip_s=0.5, chunk_ms=20.0)
+    assert r["stretch_p99"] < 1.15
+    assert r["send_drift_p99_ms"] < 15.0  # per-dispatch precision
 
 
 # ------------------------------------------------------------------ engine + probe

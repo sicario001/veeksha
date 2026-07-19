@@ -229,25 +229,36 @@ def _cpu(n: int) -> int:
     return acc
 
 
-async def _paced_send(k_chunks: int, chunk_dt: float, cpu: int) -> float:
-    """Absolute-deadline pacing (the veeksha stt.py design)."""
+async def _paced_send(k_chunks: int, chunk_dt: float, cpu: int):
+    """Absolute-deadline pacing (the veeksha stt.py design).
+
+    Returns (total_send_time, per_chunk_send_drift_ms) where each drift is the
+    signed lateness of that chunk's dispatch vs its schedule — the per-dispatch
+    precision that ASR interactivity depends on.
+    """
     start = time.monotonic()
+    per_chunk_drift_ms = []
     for i in range(k_chunks):
         _cpu(cpu)
         target = start + (i + 1) * chunk_dt
         delay = target - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
-    return time.monotonic() - start
+        # how late did this chunk actually go out vs its scheduled slot?
+        per_chunk_drift_ms.append((time.monotonic() - target) * 1000.0)
+    return time.monotonic() - start, per_chunk_drift_ms
 
 
 def probe_pacing(
     concurrency: int, clip_s: float, chunk_ms: float, cpu: int = 500
-) -> float:
-    """Return p99 of actual/ideal send time across `concurrency` paced senders.
+) -> Dict[str, float]:
+    """Measure real-time send-pacing precision across `concurrency` senders.
 
-    Models the ASR realtime-audio pacing loop: a clip of `clip_s` should take
-    `clip_s` to send. Returns the p99 stretch ratio (1.0 = perfect).
+    Models the ASR realtime-audio pacing loop: a clip of `clip_s` sent in
+    `chunk_ms` slots should take `clip_s`, with each chunk dispatched on time.
+    Returns both the aggregate stretch (p99 of total/ideal) AND the per-chunk
+    send-drift (p99/max of |actual - scheduled| per dispatch), the granularity
+    that interactivity is sensitive to.
     """
     chunk_dt = chunk_ms / 1000.0
     k = max(1, int(round(clip_s / chunk_dt)))
@@ -259,6 +270,11 @@ def probe_pacing(
         ]
         return await asyncio.gather(*tasks)
 
-    totals = asyncio.run(_run())
-    ratios = sorted(t / clip_s for t in totals)
-    return ratios[min(len(ratios) - 1, int(0.99 * (len(ratios) - 1)))]
+    results = asyncio.run(_run())
+    ratios = [total / clip_s for total, _ in results]
+    per_chunk_abs = [abs(d) for _, drifts in results for d in drifts]
+    return {
+        "stretch_p99": _pct(ratios, 99),
+        "send_drift_p99_ms": _pct(per_chunk_abs, 99),
+        "send_drift_max_ms": max(per_chunk_abs) if per_chunk_abs else float("nan"),
+    }

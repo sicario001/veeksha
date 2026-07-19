@@ -167,13 +167,18 @@ def run_preflight_check(config: "PreflightCheckConfig") -> PreflightReport:
         if config.check_pacing:
 
             def measure_pace(c: int) -> ConcurrencyPoint:
-                stretch = probe_pacing(c, config.pacing_clip_s, config.chunk_ms)
-                honest = stretch < config.stretch_threshold
+                r = probe_pacing(c, config.pacing_clip_s, config.chunk_ms)
+                # honest requires BOTH aggregate real-time pacing AND per-chunk
+                # dispatch precision (the granularity interactivity cares about).
+                honest = (
+                    r["stretch_p99"] < config.stretch_threshold
+                    and r["send_drift_p99_ms"] < config.drift_threshold_ms
+                )
                 return ConcurrencyPoint(
                     concurrency=c,
                     achieved=c,
-                    ivl_err_p99_ms=float("nan"),
-                    stretch_p99=stretch,
+                    ivl_err_p99_ms=r["send_drift_p99_ms"],  # per-dispatch send drift
+                    stretch_p99=r["stretch_p99"],
                     ttfc_p99_ms=float("nan"),
                     throughput=float("nan"),
                     server_jitter_p99_ms=0.0,
