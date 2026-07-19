@@ -35,9 +35,11 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
         self,
         config: PerformanceEvaluatorConfig,
         channel_config: Optional[AudioChannelPerformanceConfig] = None,
+        benchmark_start_time: float = 0.0,
     ):
         self.config = config
         self.channel_config = channel_config or AudioChannelPerformanceConfig()
+        self.benchmark_start_time = benchmark_start_time
         self._lock = threading.Lock()
         self._pending: Dict[int, float] = {}
         self._num_completed = 0
