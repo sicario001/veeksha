@@ -1,11 +1,16 @@
-"""A mock OpenAI-Realtime TTS WebSocket server for tests.
+"""A mock OpenAI-Realtime TTS WebSocket server for tests + preflight.
 
 Speaks the minimal realtime contract the RealtimeTTSClient expects: on
-``session.update`` it replies ``session.updated`` (echoing the output sample
-rate), and on ``response.create`` it emits ``response.created``, a fixed number
-of ``response.output_audio.delta`` frames (base64 PCM) on a known schedule, then
-``response.output_audio.done`` and ``response.done``. Deterministic transcript
-timing makes the client's audio metrics reproducible.
+``session.update`` it replies ``session.updated``, and on ``response.create`` it
+emits ``response.created``, ``num_chunks`` ``response.output_audio.delta`` frames
+(base64 PCM) on an ABSOLUTE schedule (so send backpressure never accumulates into
+the cadence), then ``response.output_audio.done`` / ``response.done``.
+
+Like the text ``MockStreamingEngine``, it is sharded across ``num_loops`` accept
+loops via SO_REUSEPORT so it can sustain many connections without one loop
+becoming the bottleneck, and it records its own emit lateness
+(``server_jitter_p99_ms``) so a benchmark can confirm the *server* is not the
+limiter at a given concurrency.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import base64
 import json
 import socket
 import threading
+import time
 from typing import List, Optional, Tuple
 
 import websockets
@@ -29,6 +35,7 @@ class MockRealtimeTTSServer:
         delta_dt: float = 0.02,
         sample_rate: int = 24000,
         host: str = "127.0.0.1",
+        num_loops: int = 8,
     ):
         self.num_chunks = num_chunks
         self.chunk_bytes = chunk_bytes
@@ -36,16 +43,36 @@ class MockRealtimeTTSServer:
         self.delta_dt = delta_dt
         self.sample_rate = sample_rate
         self.host = host
+        self.num_loops = num_loops
         self.port: int = 0
+        self._emit_lateness_ms: List[float] = []
+        self._lat_lock = threading.Lock()
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._threads: List[threading.Thread] = []
 
+    def server_jitter_p99_ms(self) -> float:
+        with self._lat_lock:
+            xs = sorted(self._emit_lateness_ms)
+        if not xs:
+            return 0.0
+        return xs[min(len(xs) - 1, int(round(0.99 * (len(xs) - 1))))]
+
+    def reset_telemetry(self) -> None:
+        with self._lat_lock:
+            self._emit_lateness_ms.clear()
+
     async def _emit_audio(self, ws) -> None:
         await ws.send(json.dumps({"type": "response.created"}))
-        await asyncio.sleep(self.first_delta_delay)
         pcm = b"\x00" * self.chunk_bytes
         encoded = base64.b64encode(pcm).decode("ascii")
-        for _ in range(self.num_chunks):
+        start = time.monotonic()
+        for i in range(self.num_chunks):
+            scheduled = start + self.first_delta_delay + i * self.delta_dt
+            now = time.monotonic()
+            if scheduled > now:
+                await asyncio.sleep(scheduled - now)
+            with self._lat_lock:
+                self._emit_lateness_ms.append((time.monotonic() - scheduled) * 1000.0)
             try:
                 await ws.send(
                     json.dumps(
@@ -54,7 +81,6 @@ class MockRealtimeTTSServer:
                 )
             except Exception:
                 return
-            await asyncio.sleep(self.delta_dt)
         try:
             await ws.send(json.dumps({"type": "response.output_audio.done"}))
             await ws.send(
@@ -107,17 +133,19 @@ class MockRealtimeTTSServer:
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
         s.close()
-        ready = threading.Event()
+        readies = [threading.Event() for _ in range(self.num_loops)]
 
-        def _run():
+        def _run(idx: int):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             stop_ev = asyncio.Event()
             self._stoppers.append((loop, stop_ev))
 
             async def _main():
-                async with websockets.serve(self._handler, self.host, self.port):
-                    ready.set()
+                async with websockets.serve(
+                    self._handler, self.host, self.port, reuse_port=True
+                ):
+                    readies[idx].set()
                     await stop_ev.wait()
 
             try:
@@ -125,10 +153,14 @@ class MockRealtimeTTSServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="mock-realtime-tts")
-        t.start()
-        self._threads.append(t)
-        ready.wait(timeout=5.0)
+        for i in range(self.num_loops):
+            t = threading.Thread(
+                target=_run, args=(i,), daemon=True, name="mock-rt-tts"
+            )
+            t.start()
+            self._threads.append(t)
+        for r in readies:
+            r.wait(timeout=5.0)
         return self
 
     def stop(self) -> None:

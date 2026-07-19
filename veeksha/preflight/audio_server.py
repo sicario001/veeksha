@@ -162,14 +162,17 @@ class MockSTTPreflightServer:
         first_delta_delay: float = 0.05,
         delta_dt: float = 0.03,
         host: str = "127.0.0.1",
+        num_loops: int = 8,
     ):
         self.transcript = transcript
         self.first_delta_delay = first_delta_delay
         self.delta_dt = delta_dt
         self.host = host
+        self.num_loops = num_loops
         self.port: int = 0
         # per-connection append-arrival offsets (ms from that conn's first append)
         self.append_arrivals: List[List[float]] = []
+        self._arr_lock = threading.Lock()
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._threads: List[threading.Thread] = []
 
@@ -228,7 +231,8 @@ class MockSTTPreflightServer:
                     # HERE (deterministic — before the connection closes) so the
                     # measurement never races the close, then emit the transcript.
                     if not recorded and arrivals:
-                        self.append_arrivals.append(list(arrivals))
+                        with self._arr_lock:
+                            self.append_arrivals.append(list(arrivals))
                         recorded = True
                     if transcript_task is None:
                         transcript_task = asyncio.ensure_future(_emit_transcript())
@@ -238,24 +242,31 @@ class MockSTTPreflightServer:
             if transcript_task is not None:
                 transcript_task.cancel()
             if not recorded and arrivals:  # client that closed without a final commit
-                self.append_arrivals.append(arrivals)
+                with self._arr_lock:
+                    self.append_arrivals.append(arrivals)
 
     def start(self) -> "MockSTTPreflightServer":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
         s.close()
-        ready = threading.Event()
+        readies = [threading.Event() for _ in range(self.num_loops)]
 
-        def _run():
+        def _run(idx: int):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             stop_ev = asyncio.Event()
             self._stoppers.append((loop, stop_ev))
 
             async def _main():
-                async with websockets.serve(self._handler, self.host, self.port):
-                    ready.set()
+                # Sharded across num_loops loops via SO_REUSEPORT so the server's
+                # own receive-processing lag stays small at high concurrency —
+                # otherwise the recorded append-arrival time would reflect server
+                # load, not the client's send pacing.
+                async with websockets.serve(
+                    self._handler, self.host, self.port, reuse_port=True
+                ):
+                    readies[idx].set()
                     await stop_ev.wait()
 
             try:
@@ -263,10 +274,14 @@ class MockSTTPreflightServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="preflight-stt")
-        t.start()
-        self._threads.append(t)
-        ready.wait(timeout=5.0)
+        for i in range(self.num_loops):
+            t = threading.Thread(
+                target=_run, args=(i,), daemon=True, name="preflight-stt"
+            )
+            t.start()
+            self._threads.append(t)
+        for r in readies:
+            r.wait(timeout=5.0)
         return self
 
     def stop(self) -> None:
