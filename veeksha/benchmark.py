@@ -67,17 +67,30 @@ def _maybe_pregenerate_sessions(benchmark_config, session_generator) -> Optional
 
 
 def _maybe_run_native(
-    benchmark_config, evaluator, session_generator, pregenerated_sessions
+    benchmark_config,
+    evaluator,
+    session_generator,
+    pregenerated_sessions,
+    seed_manager=None,
 ):
     """Run the batch over the native (C++) transport when the client opts in.
 
     Returns the finalized EvaluationResult, or None to fall back to the Python
-    worker pipeline. Native owns connection concurrency + kernel-time timing, so
-    this path removes the Python per-event overhead. It needs a bounded run
-    (max_sessions > 0) and handles independent (single-request) sessions; the
-    Python pipeline still serves rate-based / multi-turn-dependent traffic.
+    worker pipeline. Native owns connection concurrency + kernel-time receive
+    timing AND (for rate-based traffic) the arrival-dispatch timing, so this path
+    removes the Python per-event overhead on both ends.
+
+    Guards / fallbacks (kept on the Python transport):
+      - non-bounded runs (max_sessions <= 0);
+      - multi-turn / dependent sessions — native lacks inter-node content flow
+        (injecting turn N's output into turn N+1's prompt), so conversational
+        fidelity would be wrong; the Python path handles history correctly.
     """
-    from veeksha.native.runner import feed_native_results, should_use_native
+    from veeksha.native.runner import (
+        compute_dispatch_offsets,
+        feed_native_results,
+        should_use_native,
+    )
 
     client_config = benchmark_config.client
     if not should_use_native(client_config):
@@ -98,17 +111,43 @@ def _maybe_run_native(
                 sessions.append(session_generator.generate_session())
             except StopIteration:
                 break
+
+    # Multi-turn / dependent sessions need history injection between turns, which
+    # native does not do yet — keep them on the Python pipeline for correctness.
+    if any(len(s.requests) > 1 for s in sessions):
+        logger.info(
+            "Native transport skipped: multi-turn/dependent sessions require "
+            "inter-node history flow (Python pipeline handles these)."
+        )
+        return None
+
     requests = [req for s in sessions for req in s.requests.values()]
     concurrency = getattr(
         benchmark_config.traffic_scheduler, "target_concurrent_sessions", 0
     ) or min(len(requests), 64)
+
+    # Rate-based traffic: native owns the arrival-dispatch schedule (open-loop),
+    # so QPS runs are faithful AND native-timed. Concurrent traffic: closed-loop
+    # (native fills concurrency + refills), so no per-request schedule.
+    dispatch_offsets = None
+    if seed_manager is not None:
+        dispatch_offsets = compute_dispatch_offsets(
+            sessions, benchmark_config.traffic_scheduler, seed_manager
+        )
     logger.info(
-        "Native transport: %d requests at concurrency %d (%s)",
+        "Native transport: %d requests, concurrency %d, %s (%s)",
         len(requests),
         concurrency,
+        "open-loop arrival schedule" if dispatch_offsets else "closed-loop",
         client_config.get_type(),
     )
-    feed_native_results(requests, evaluator, client_config, concurrency)
+    feed_native_results(
+        requests,
+        evaluator,
+        client_config,
+        concurrency,
+        dispatch_offsets_s=dispatch_offsets,
+    )
     return evaluator.finalize()
 
 
@@ -331,7 +370,11 @@ def _run_benchmark(
     # plaintext + the run is bounded), run the batch over the C++ engine instead
     # of the Python worker pipeline, then finalize/save the same way.
     native_result = _maybe_run_native(
-        benchmark_config, evaluator, session_generator, pregenerated_sessions
+        benchmark_config,
+        evaluator,
+        session_generator,
+        pregenerated_sessions,
+        seed_manager=seed_manager,
     )
     if native_result is not None:
         os.makedirs(f"{benchmark_config.output_dir}/metrics", exist_ok=True)

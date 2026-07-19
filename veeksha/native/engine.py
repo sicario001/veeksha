@@ -78,6 +78,7 @@ class NativeResult:
     status: int
     content: str
     stream: TimedEventStream
+    dispatch_offset_s: float = 0.0  # actual launch time (open-loop arrival dispatch)
     error: str = ""
 
     @property
@@ -103,15 +104,26 @@ class NativeReceiveEngine:
         sse: bool = True,
         timeout_s: float = 120.0,
         modality: ChannelModality = ChannelModality.TEXT,
+        dispatch_offsets_s: Optional[List[float]] = None,
     ) -> List[NativeResult]:
         """Send all requests (native owns concurrency); return per-request results.
 
         Each result's ``stream`` carries offsets in *seconds* from send-time with
         per-event sizes — ready for the shared per-stream derivations
         (time_to_first_event / inter_event_deltas / RTF).
+
+        When ``dispatch_offsets_s`` is given the engine runs OPEN-LOOP: request i
+        is launched on its arrival deadline (rate-based traffic), with
+        ``concurrency`` as a max-in-flight safety cap — so native owns the
+        arrival-dispatch timing, not just the receive timing.
         """
         wire = [r.to_wire(self.host) for r in requests]
-        raw = _ext.run_batch(self.host, self.port, wire, concurrency, timeout_s, sse)
+        offsets_ms = (
+            [s * 1000.0 for s in dispatch_offsets_s] if dispatch_offsets_s else []
+        )
+        raw = _ext.run_batch(
+            self.host, self.port, wire, concurrency, timeout_s, sse, offsets_ms
+        )
         results: List[NativeResult] = []
         for item in raw:
             events = [
@@ -125,6 +137,7 @@ class NativeReceiveEngine:
                     status=item.status,
                     content=item.content,
                     stream=stream,
+                    dispatch_offset_s=item.dispatch_offset_ms / 1000.0,
                     error=item.error,
                 )
             )

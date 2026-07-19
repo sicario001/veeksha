@@ -215,6 +215,7 @@ struct ReqResult {
   std::string content;             // concatenated SSE data payloads (sans [DONE])
   std::vector<double> offsets_ms;  // per-event arrival offset (ms from send)
   std::vector<int> sizes;          // per-event payload size (bytes)
+  double dispatch_offset_ms = 0.0;  // actual launch time (ms from run start)
   std::string error;
 };
 
@@ -274,8 +275,8 @@ static void parse_body_sse(EngineConn& c) {
 
 static std::vector<ReqResult> run_batch(const std::string& host, int port,
                                         const std::vector<std::string>& requests,
-                                        int concurrency, double timeout_s,
-                                        bool sse) {
+                                        int concurrency, double timeout_s, bool sse,
+                                        const std::vector<double>& dispatch_offsets_ms) {
   struct rlimit rl;
   getrlimit(RLIMIT_NOFILE, &rl);
   rl.rlim_cur = std::max<rlim_t>(rl.rlim_cur, (rlim_t)(concurrency + 64));
@@ -289,9 +290,19 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
   std::unordered_map<int, EngineConn> conns;
   int launched = 0, completed = 0;
   double t0 = now_ms();
+  bool open_loop = !dispatch_offsets_ms.empty();
 
-  auto try_launch = [&]() {
+  // Closed-loop (no offsets): fill to `concurrency` and refill on completion.
+  // Open-loop (offsets given): launch request i at its arrival deadline
+  // dispatch_offsets_ms[i], with `concurrency` as a max-in-flight safety cap —
+  // native owns the arrival-dispatch timing (kernel-time send on the schedule).
+  // Returns ms until the next pending dispatch deadline (open-loop) or 0.
+  auto try_launch = [&]() -> double {
+    double now = now_ms() - t0;
     while ((int)conns.size() < concurrency && launched < total) {
+      if (open_loop && dispatch_offsets_ms[launched] > now + 0.05) {
+        return dispatch_offsets_ms[launched] - now;  // not due yet
+      }
       int fd = make_conn(host, port);
       if (fd < 0) {
         results[launched].error = "connect failed";
@@ -302,11 +313,13 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
       EngineConn c;
       c.index = launched;
       c.sse = sse;
+      results[launched].dispatch_offset_ms = now_ms() - t0;
       conns.emplace(fd, std::move(c));
       launched++;
     }
+    return 1e9;
   };
-  try_launch();
+  double next_dispatch = try_launch();
 
   while (completed < total && (now_ms() - t0) < timeout_s * 1000.0) {
     std::vector<struct pollfd> pfds;
@@ -318,7 +331,11 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
       p.revents = 0;
       pfds.push_back(p);
     }
-    int n = poll(pfds.data(), pfds.size(), 50);
+    // Wake in time for the next arrival deadline (open-loop) so dispatch is
+    // punctual rather than waiting the full 50ms poll tick.
+    int poll_ms = 50;
+    if (open_loop && next_dispatch < poll_ms) poll_ms = (int)std::max(0.0, next_dispatch);
+    int n = poll(pfds.data(), pfds.size(), poll_ms);
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
@@ -389,7 +406,7 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
       conns.erase(it);
       completed++;
     }
-    try_launch();
+    next_dispatch = try_launch();
   }
   for (auto& kv : conns) {
     // timed out mid-flight
@@ -400,12 +417,13 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
   return results;
 }
 
-static std::vector<ReqResult> py_run_batch(const std::string& host, int port,
-                                           const std::vector<std::string>& requests,
-                                           int concurrency, double timeout_s,
-                                           bool sse) {
+static std::vector<ReqResult> py_run_batch(
+    const std::string& host, int port,
+    const std::vector<std::string>& requests, int concurrency, double timeout_s,
+    bool sse, const std::vector<double>& dispatch_offsets_ms) {
   py::gil_scoped_release release;
-  return run_batch(host, port, requests, concurrency, timeout_s, sse);
+  return run_batch(host, port, requests, concurrency, timeout_s, sse,
+                   dispatch_offsets_ms);
 }
 
 // ===========================================================================
@@ -1053,14 +1071,19 @@ PYBIND11_MODULE(veeksha_native, m, py::mod_gil_not_used()) {
       .def_readonly("content", &ReqResult::content)
       .def_readonly("offsets_ms", &ReqResult::offsets_ms)
       .def_readonly("sizes", &ReqResult::sizes)
+      .def_readonly("dispatch_offset_ms", &ReqResult::dispatch_offset_ms)
       .def_readonly("error", &ReqResult::error);
 
   m.def("run_batch", &py_run_batch, py::arg("host"), py::arg("port"),
         py::arg("requests"), py::arg("concurrency"), py::arg("timeout_s") = 120.0,
         py::arg("sse") = true,
+        py::arg("dispatch_offsets_ms") = std::vector<double>(),
         "Real per-request engine: owns connection concurrency over one poll() "
         "loop, sends caller-built HTTP requests, returns per-request ReqResult "
-        "(status, content, kernel-time chunk offsets_ms + sizes).");
+        "(status, content, kernel-time chunk offsets_ms + sizes, actual "
+        "dispatch_offset_ms). With dispatch_offsets_ms it runs OPEN-LOOP: each "
+        "request is launched on its arrival deadline (concurrency = max in-flight "
+        "cap) so native owns the arrival-dispatch timing too.");
 
   py::class_<ChainTurn>(m, "ChainTurn")
       .def_readonly("offsets_ms", &ChainTurn::offsets_ms)

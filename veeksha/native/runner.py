@@ -60,11 +60,48 @@ def _client_task(client_config: Any) -> str:
     )
 
 
+def compute_dispatch_offsets(
+    sessions: List[Any], traffic_config: Any, seed_manager: Any
+) -> Optional[List[float]]:
+    """Per-request arrival offsets (seconds) for rate-based (open-loop) traffic.
+
+    Reproduces the rate scheduler's schedule: each session starts at the running
+    sum of interarrival intervals (from the same seeded interval generator), and
+    each request inherits its node's wait_after_ready. Returns None for
+    non-rate traffic (closed-loop), where native fills concurrency + refills.
+    Aligned with the flattened request order used by ``execute_native``.
+    """
+    from veeksha.config.traffic import RateTrafficConfig
+
+    if not isinstance(traffic_config, RateTrafficConfig):
+        return None
+    from veeksha.generator.interval.registry import IntervalGeneratorRegistry
+
+    interval_gen = IntervalGeneratorRegistry.get(
+        traffic_config.interval_generator.get_type(),
+        traffic_config.interval_generator,
+        rng=seed_manager.numpy_factory("interval")(),
+    )
+    offsets: List[float] = []
+    start = 0.0
+    for session in sessions:
+        graph = getattr(session, "session_graph", None)
+        for node_id in session.requests:
+            wait = 0.0
+            if graph is not None and hasattr(graph, "nodes"):
+                node = graph.nodes.get(node_id)
+                wait = getattr(node, "wait_after_ready", 0.0) if node else 0.0
+            offsets.append(start + wait)
+        start += interval_gen.get_next_interval()
+    return offsets
+
+
 def execute_native(
     requests: List[Request],
     client_config: Any,
     concurrency: int,
     timeout_s: float = 120.0,
+    dispatch_offsets_s: Optional[List[float]] = None,
 ) -> List[Any]:
     """Run requests through the native transport for the client's modality."""
     host, port = _host_port(client_config.api_base or "http://127.0.0.1:80")
@@ -76,6 +113,7 @@ def execute_native(
             concurrency=concurrency,
             model=getattr(client_config, "model", "dummy") or "dummy",
             timeout_s=timeout_s,
+            dispatch_offsets_s=dispatch_offsets_s,
         )
     if task == "tts":
         return transport.run_realtime_tts(
@@ -99,10 +137,13 @@ def feed_native_results(
     client_config: Any,
     concurrency: int,
     timeout_s: float = 120.0,
+    dispatch_offsets_s: Optional[List[float]] = None,
 ) -> int:
     """Run a request batch natively and feed each result to ``evaluator`` (no
     finalize). Returns the number of successful requests."""
-    results = execute_native(requests, client_config, concurrency, timeout_s)
+    results = execute_native(
+        requests, client_config, concurrency, timeout_s, dispatch_offsets_s
+    )
     n_ok = 0
     for result in results:
         evaluator.register_request(

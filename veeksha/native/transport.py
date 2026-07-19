@@ -58,6 +58,7 @@ class NativeTransport:
         path: str = "/v1/chat/completions",
         default_max_tokens: int = 16,
         timeout_s: float = 120.0,
+        dispatch_offsets_s: Optional[List[float]] = None,
     ) -> List[RequestResult]:
         native_reqs = []
         for request in requests:
@@ -85,6 +86,7 @@ class NativeTransport:
             sse=True,
             timeout_s=timeout_s,
             modality=ChannelModality.TEXT,
+            dispatch_offsets_s=dispatch_offsets_s,
         )
         out = []
         for request, res in zip(requests, results):
