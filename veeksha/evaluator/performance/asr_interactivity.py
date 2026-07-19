@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from veeksha.core.cross_stream import visibility_latencies
 from veeksha.evaluator.performance.asr_normalizer import EnglishTextNormalizer
 
 _normalizer = EnglishTextNormalizer()
@@ -112,17 +113,21 @@ def compute_interactivity_stats(
                 ):
                     first_seen_ms[ref_index] = elapsed_ms
 
-    latencies = [
-        max(0.0, seen_ms - word.end_ms)
+    # ASR interactivity IS the shared cross-stream visibility operator: align
+    # each reference word's completion (input timeline, in ms) with when it first
+    # became visible in the transcript (output timeline), then aggregate.
+    pairs = [
+        (word.end_ms, seen_ms)
         for seen_ms, word in zip(first_seen_ms, reference_words)
         if seen_ms is not None
     ]
-    if not latencies:
+    stats = visibility_latencies(pairs)
+    if stats is None:
         return None
     return InteractivityStats(
-        mean_latency_ms=sum(latencies) / len(latencies),
-        word_count=len(latencies),
-        latencies_ms=latencies,
+        mean_latency_ms=stats.mean_latency,
+        word_count=stats.count,
+        latencies_ms=stats.latencies,
     )
 
 
