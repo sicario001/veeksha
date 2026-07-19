@@ -25,38 +25,39 @@ class MockSTTServer:
         first_delta_delay: float = 0.05,
         delta_dt: float = 0.03,
         host: str = "127.0.0.1",
+        num_loops: int = 8,
     ):
         self.transcript = transcript
         self.first_delta_delay = first_delta_delay
         self.delta_dt = delta_dt
         self.host = host
+        self.num_loops = num_loops
         self.port: int = 0
+        # Pre-serialize the fixed transcript messages once so the emit loop stays
+        # cheap under many connections (no per-word json.dumps).
+        words = transcript.split()
+        self._created_msg = json.dumps({"type": "session.created"})
+        self._delta_msgs = [
+            json.dumps({"type": "transcription.delta", "delta": (" " + w if i else w)})
+            for i, w in enumerate(words)
+        ]
+        self._done_msg = json.dumps({"type": "transcription.done", "text": transcript})
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._threads: List[threading.Thread] = []
 
     async def _handler(self, ws) -> None:
-        await ws.send(json.dumps({"type": "session.created"}))
-        words = self.transcript.split()
+        await ws.send(self._created_msg)
 
         async def _sender() -> None:
             await asyncio.sleep(self.first_delta_delay)
-            for i, w in enumerate(words):
+            for delta_msg in self._delta_msgs:  # pre-serialized
                 try:
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "transcription.delta",
-                                "delta": (" " + w if i else w),
-                            }
-                        )
-                    )
+                    await ws.send(delta_msg)
                 except Exception:
                     return
                 await asyncio.sleep(self.delta_dt)
             try:
-                await ws.send(
-                    json.dumps({"type": "transcription.done", "text": self.transcript})
-                )
+                await ws.send(self._done_msg)
                 await ws.close()  # terminal: let clients stop promptly
             except Exception:
                 pass
@@ -75,17 +76,19 @@ class MockSTTServer:
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
         s.close()
-        ready = threading.Event()
+        readies = [threading.Event() for _ in range(self.num_loops)]
 
-        def _run():
+        def _run(idx: int):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             stop_ev = asyncio.Event()
             self._stoppers.append((loop, stop_ev))
 
             async def _main():
-                async with websockets.serve(self._handler, self.host, self.port):
-                    ready.set()
+                async with websockets.serve(
+                    self._handler, self.host, self.port, reuse_port=True
+                ):
+                    readies[idx].set()
                     await stop_ev.wait()
 
             try:
@@ -93,10 +96,12 @@ class MockSTTServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="mock-stt")
-        t.start()
-        self._threads.append(t)
-        ready.wait(timeout=5.0)
+        for i in range(self.num_loops):
+            t = threading.Thread(target=_run, args=(i,), daemon=True, name="mock-stt")
+            t.start()
+            self._threads.append(t)
+        for r in readies:
+            r.wait(timeout=5.0)
         return self
 
     def stop(self) -> None:

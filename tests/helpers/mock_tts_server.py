@@ -23,19 +23,31 @@ class MockTTSServer:
         chunk_dt: float = 0.05,
         prefill_s: float = 0.05,
         host: str = "127.0.0.1",
+        num_loops: int = 8,
     ):
         self.chunk_bytes = chunk_bytes
         self.num_chunks = num_chunks
         self.chunk_dt = chunk_dt
         self.prefill_s = prefill_s
         self.host = host
+        self.num_loops = num_loops
         self.port: int = 0
+        self._payload = b"\x00" * chunk_bytes  # precomputed once
+        self._emit_lateness_ms: List[float] = []
+        self._lat_lock = threading.Lock()
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._threads: List[threading.Thread] = []
 
     @property
     def total_bytes(self) -> int:
         return self.chunk_bytes * self.num_chunks
+
+    def server_jitter_p99_ms(self) -> float:
+        with self._lat_lock:
+            xs = sorted(self._emit_lateness_ms)
+        if not xs:
+            return 0.0
+        return xs[min(len(xs) - 1, int(round(0.99 * (len(xs) - 1))))]
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         try:
@@ -67,13 +79,14 @@ class MockTTSServer:
             return
 
         start = time.monotonic()
-        payload = b"\x00" * self.chunk_bytes
         for i in range(self.num_chunks):
             scheduled = start + self.prefill_s + i * self.chunk_dt
             now = time.monotonic()
             if scheduled > now:
                 await asyncio.sleep(scheduled - now)
-            writer.write(payload)
+            with self._lat_lock:
+                self._emit_lateness_ms.append((time.monotonic() - scheduled) * 1000.0)
+            writer.write(self._payload)  # precomputed
             try:
                 await writer.drain()
             except ConnectionResetError, BrokenPipeError:
@@ -89,9 +102,9 @@ class MockTTSServer:
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
         s.close()
-        ready = threading.Event()
+        readies = [threading.Event() for _ in range(self.num_loops)]
 
-        def _run():
+        def _run(idx: int):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             stop_ev = asyncio.Event()
@@ -101,7 +114,7 @@ class MockTTSServer:
                 server = await asyncio.start_server(
                     self._serve, self.host, self.port, reuse_port=True
                 )
-                ready.set()
+                readies[idx].set()
                 await stop_ev.wait()
                 server.close()
                 try:
@@ -114,10 +127,12 @@ class MockTTSServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="mock-tts")
-        t.start()
-        self._threads.append(t)
-        ready.wait(timeout=5.0)
+        for i in range(self.num_loops):
+            t = threading.Thread(target=_run, args=(i,), daemon=True, name="mock-tts")
+            t.start()
+            self._threads.append(t)
+        for r in readies:
+            r.wait(timeout=5.0)
         return self
 
     def stop(self) -> None:
