@@ -321,6 +321,8 @@ class _STTClientBase(BaseLLMClient):
         self,
         pcm_bytes: bytes | memoryview,
         wire_messages: Optional[list[str]] = None,
+        on_request_sent=None,
+        on_request_dispatched=None,
     ) -> STTStreamResult:
         """Stream pre-decoded PCM16 to the provider and collect the transcript.
 
@@ -354,6 +356,8 @@ class _STTClientBase(BaseLLMClient):
             compression=self._ws_compression,
         ) as ws:
             await self._open_session(ws)
+            if on_request_dispatched is not None:
+                on_request_dispatched()
 
             async def _send() -> None:
                 nonlocal audio_end_at, audio_started_at
@@ -397,6 +401,8 @@ class _STTClientBase(BaseLLMClient):
                                 audio_started_at is not None
                             ), "delta arrived before any audio was sent"
                             ttfc = (now - audio_started_at) * 1000
+                            if on_request_sent is not None:
+                                on_request_sent()
                         transcript_chunks.append(text)
                         chunk_count += 1
                         current_transcript = _clean_transcript(
@@ -478,6 +484,8 @@ class _STTClientBase(BaseLLMClient):
         request: Request,
         session_id: int,
         session_total_requests: int = 1,
+        on_request_sent=None,
+        on_request_dispatched=None,
     ) -> RequestResult:
         """Stream an audio file to the STT API and collect transcription metrics."""
 
@@ -553,7 +561,12 @@ class _STTClientBase(BaseLLMClient):
 
         try:
             async with asyncio.timeout(self._request_timeout):
-                stream_result = await self._stream(pcm_bytes, wire_messages)
+                stream_result = await self._stream(
+                    pcm_bytes,
+                    wire_messages,
+                    on_request_sent=on_request_sent,
+                    on_request_dispatched=on_request_dispatched,
+                )
         except TimeoutError:
             error_code = 408
             error_msg = f"STT request timed out after {self._request_timeout}s"
