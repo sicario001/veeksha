@@ -328,6 +328,9 @@ def probe_audio_transport(
             return await asyncio.gather(*tasks, return_exceptions=True)
 
         results = asyncio.run(_run())
+        # the server's own emit lateness — so callers can tell whether high drift
+        # is the client (real) or the mock server saturating (server-limited).
+        server_jitter = server.server_jitter_p99_ms()
     finally:
         server.stop()
 
@@ -353,6 +356,7 @@ def probe_audio_transport(
         "recv_drift_max_ms": (
             max(inter_chunk_drift_ms) if inter_chunk_drift_ms else float("nan")
         ),
+        "server_jitter_p99_ms": server_jitter,
     }
 
 

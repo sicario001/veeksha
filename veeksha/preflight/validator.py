@@ -198,9 +198,15 @@ def run_preflight_check(config: "PreflightCheckConfig") -> PreflightReport:
                 r = probe_audio_transport(
                     c, num_chunks=config.num_chunks, chunk_ms=config.chunk_ms
                 )
+                srv = r.get("server_jitter_p99_ms", 0.0)
+                # engine must not be the bottleneck for the point to count.
+                engine_ok = srv < max(
+                    config.drift_threshold_ms, r["recv_drift_p99_ms"] * 0.5
+                )
                 honest = (
                     r["achieved"] >= 0.95 * c
                     and r["recv_drift_p99_ms"] < config.drift_threshold_ms
+                    and engine_ok
                 )
                 return ConcurrencyPoint(
                     concurrency=c,
@@ -209,7 +215,7 @@ def run_preflight_check(config: "PreflightCheckConfig") -> PreflightReport:
                     stretch_p99=float("nan"),
                     ttfc_p99_ms=float("nan"),
                     throughput=float("nan"),
-                    server_jitter_p99_ms=0.0,
+                    server_jitter_p99_ms=srv,
                     honest=honest,
                 )
 
