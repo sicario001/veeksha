@@ -190,6 +190,37 @@ def run_preflight_check(config: "PreflightCheckConfig") -> PreflightReport:
             )
             report.checks.append(pace)
 
+        # ---- real audio-transport receive-drift check (only if requested) ----
+        if config.check_audio_transport:
+            from veeksha.preflight.probe import probe_audio_transport
+
+            def measure_audio(c: int) -> ConcurrencyPoint:
+                r = probe_audio_transport(
+                    c, num_chunks=config.num_chunks, chunk_ms=config.chunk_ms
+                )
+                honest = (
+                    r["achieved"] >= 0.95 * c
+                    and r["recv_drift_p99_ms"] < config.drift_threshold_ms
+                )
+                return ConcurrencyPoint(
+                    concurrency=c,
+                    achieved=int(r["achieved"]),
+                    ivl_err_p99_ms=r["recv_drift_p99_ms"],  # per-chunk receive drift
+                    stretch_p99=float("nan"),
+                    ttfc_p99_ms=float("nan"),
+                    throughput=float("nan"),
+                    server_jitter_p99_ms=0.0,
+                    honest=honest,
+                )
+
+            audio = _run_check(
+                "audio-transport receive drift (realtime WS)",
+                target,
+                ladder,
+                measure_audio,
+            )
+            report.checks.append(audio)
+
         # ---- optional native (C++) receive-path comparison ----
         if config.compare_native:
             from veeksha import native

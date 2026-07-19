@@ -103,3 +103,32 @@ def test_run_preflight_check_end_to_end_small():
     for chk in report.checks:
         assert chk.points  # measured at least one concurrency
     assert isinstance(report.format_text(), str)
+
+
+# ------------------------------------------------------------------ real audio transport
+def test_probe_audio_transport_is_accurate_at_low_concurrency():
+    """Driving the REAL realtime client over WS reproduces the server cadence."""
+    from veeksha.preflight.probe import probe_audio_transport
+
+    r = probe_audio_transport(concurrency=4, num_chunks=12, chunk_ms=20.0)
+    assert r["achieved"] == 4.0
+    # per-chunk receive drift on localhost WS should be small
+    assert r["recv_drift_p99_ms"] < 25.0
+
+
+def test_run_preflight_check_includes_audio_transport_when_enabled():
+    cfg = PreflightCheckConfig(
+        target_concurrency=8,
+        num_client_threads=2,
+        num_dispatcher_threads=1,
+        num_completion_threads=1,
+        num_chunks=10,
+        budget_s=1.0,
+        check_pacing=False,
+        check_audio_transport=True,
+    )
+    report = run_preflight_check(cfg)
+    names = {c.name for c in report.checks}
+    assert any("audio-transport" in n for n in names)
+    audio = next(c for c in report.checks if "audio-transport" in c.name)
+    assert audio.points  # measured at least one concurrency rung

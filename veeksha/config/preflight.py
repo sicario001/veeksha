@@ -55,6 +55,12 @@ class PreflightCheckConfig(VeekshaCommand, name="preflight"):
     pacing_clip_s: float = field(
         2.0, help="Synthetic clip duration for the pacing check (s)."
     )
+    check_audio_transport: bool = field(
+        False,
+        help="Also measure per-chunk receive drift on the REAL realtime-audio "
+        "WebSocket transport (drives the actual RealtimeTTSClient against a "
+        "fixed-cadence dummy server). Off by default: pulls the client package.",
+    )
     compare_native: bool = field(
         False,
         help="Also measure the native (C++) receive path for comparison, if the "

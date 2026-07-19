@@ -278,3 +278,90 @@ def probe_pacing(
         "send_drift_p99_ms": _pct(per_chunk_abs, 99),
         "send_drift_max_ms": max(per_chunk_abs) if per_chunk_abs else float("nan"),
     }
+
+
+def probe_audio_transport(
+    concurrency: int,
+    num_chunks: int = 20,
+    chunk_ms: float = 20.0,
+    request_timeout: float = 30.0,
+) -> Dict[str, float]:
+    """Per-chunk receive drift on the REAL realtime-audio WebSocket transport.
+
+    The audio analogue of ``probe_receive_drift`` (which covers SSE): drive the
+    actual ``RealtimeTTSClient`` against a fixed-cadence dummy realtime server at
+    ``concurrency`` and measure how faithfully the client's own per-chunk arrival
+    timeline reproduces the known ``chunk_ms`` cadence. This exercises the real WS
+    receive path (framing, base64 decode, timestamping) rather than a synthetic
+    model, so it catches per-token/per-chunk receive drift the interactivity
+    metric is sensitive to.
+
+    Returns p99/max of ``|observed inter-chunk gap - chunk_ms|`` (ms) and the
+    achieved request count.
+    """
+    # Imported lazily: the client package pulls heavier deps that the rest of the
+    # preflight (pure SSE + pacing) does not need.
+    from veeksha.client.realtime_tts import RealtimeTTSClient
+    from veeksha.config.client import RealtimeTTSClientConfig
+    from veeksha.core.audio_contract import AudioMetricKey
+    from veeksha.preflight.audio_server import DummyRealtimeAudioServer
+
+    chunk_dt_ms = chunk_ms
+    server = DummyRealtimeAudioServer(
+        num_chunks=num_chunks, chunk_dt=chunk_ms / 1000.0
+    ).start()
+    try:
+        config = RealtimeTTSClientConfig(
+            api_base=f"http://127.0.0.1:{server.port}",
+            model="preflight-tts",
+            request_timeout=request_timeout,
+        )
+        client = RealtimeTTSClient(config)
+
+        async def _run():
+            tasks = [
+                asyncio.create_task(
+                    client.send_request(_single_text_request(i), session_id=i)
+                )
+                for i in range(concurrency)
+            ]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        results = asyncio.run(_run())
+    finally:
+        server.stop()
+
+    inter_chunk_drift_ms: List[float] = []
+    achieved = 0
+    for result in results:
+        if isinstance(result, BaseException) or not getattr(result, "success", False):
+            continue
+        channel = result.channels.get(ChannelModality.AUDIO)
+        if channel is None:
+            continue
+        timeline = channel.metrics.get(AudioMetricKey.AUDIO_CHUNK_TIMESTAMPS.value, [])
+        if len(timeline) < 2:
+            continue
+        achieved += 1
+        offsets_ms = [row[0] for row in timeline]
+        for a, b in zip(offsets_ms, offsets_ms[1:]):
+            inter_chunk_drift_ms.append(abs((b - a) - chunk_dt_ms))
+
+    return {
+        "achieved": float(achieved),
+        "recv_drift_p99_ms": _pct(inter_chunk_drift_ms, 99),
+        "recv_drift_max_ms": (
+            max(inter_chunk_drift_ms) if inter_chunk_drift_ms else float("nan")
+        ),
+    }
+
+
+def _single_text_request(rid: int) -> Request:
+    return Request(
+        id=rid,
+        channels={
+            ChannelModality.TEXT: TextChannelRequestContent(
+                input_text="preflight realtime audio transport probe request"
+            )
+        },
+    )
