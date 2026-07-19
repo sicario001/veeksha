@@ -25,9 +25,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1169,6 +1173,206 @@ static std::vector<WsResult> py_ws_stream(
                    send_offsets_ms);
 }
 
+// ---------------------------------------------------------------------------
+// NativeSseServer — a native (C++) reference SSE server for drift VALIDATION.
+//
+// On a single dev box the Python asyncio mock server can't emit more punctually
+// than asyncio's timer granularity (~1-3 ms), which shows up as "server jitter"
+// and sets a floor under the client-measured drift. That floor is the reference,
+// not the native client. This server emits each chunk on an ABSOLUTE realtime
+// deadline from one poll loop with no GIL / coroutine overhead, so its own emit
+// jitter is sub-ms even under core contention — letting us measure the native
+// CLIENT's true fidelity instead of the Python reference's punctuality.
+//
+// It is a validation/bench tool (real runs hit real inference servers). It is
+// deliberately simple: one accept+emit loop, non-blocking sends, per-chunk emit
+// lateness recorded for the same server_jitter_p99_ms() gate the mock uses.
+// ---------------------------------------------------------------------------
+struct SseServerConn {
+  bool headers_sent = false;
+  bool finished = false;
+  double start = 0.0;  // realtime ms when headers were sent (schedule origin)
+  int next_chunk = 0;
+  std::string reqbuf;
+};
+
+class NativeSseServer {
+ public:
+  NativeSseServer(int num_chunks, double cadence_ms, double prefill_ms,
+                  int chunk_bytes)
+      : num_chunks_(num_chunks),
+        cadence_ms_(cadence_ms),
+        prefill_ms_(prefill_ms),
+        chunk_bytes_(chunk_bytes) {}
+
+  ~NativeSseServer() { stop(); }
+
+  int start() {
+    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd_ < 0) throw std::runtime_error("socket() failed");
+    int one = 1;
+    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(listen_fd_, (sockaddr*)&addr, sizeof(addr)) < 0)
+      throw std::runtime_error("bind() failed");
+    socklen_t len = sizeof(addr);
+    getsockname(listen_fd_, (sockaddr*)&addr, &len);
+    port_ = ntohs(addr.sin_port);
+    listen(listen_fd_, 1024);
+    set_nonblock(listen_fd_);
+
+    std::string content(std::max(1, chunk_bytes_), 'x');
+    data_line_ = "data: {\"choices\":[{\"delta\":{\"content\":\"" + content +
+                 "\"}}],\"model\":\"mock\"}\n\n";
+    done_line_ = "data: [DONE]\n\n";
+    headers_ =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+        "Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
+
+    stop_.store(false);
+    thread_ = std::thread([this] { this->run(); });
+    return port_;
+  }
+
+  void stop() {
+    stop_.store(true);
+    if (thread_.joinable()) thread_.join();
+    if (listen_fd_ >= 0) {
+      close(listen_fd_);
+      listen_fd_ = -1;
+    }
+  }
+
+  double server_jitter_p99_ms() {
+    std::lock_guard<std::mutex> g(lat_mutex_);
+    if (lateness_.empty()) return 0.0;
+    std::vector<double> v = lateness_;
+    std::sort(v.begin(), v.end());
+    size_t idx = (size_t)((v.size() - 1) * 0.99);
+    return v[idx];
+  }
+
+ private:
+  static void set_nonblock(int fd) {
+    int f = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, f | O_NONBLOCK);
+  }
+
+  void send_all(int fd, const std::string& s) {
+    size_t off = 0;
+    while (off < s.size()) {
+      ssize_t w = ::send(fd, s.data() + off, s.size() - off, 0);
+      if (w > 0) {
+        off += (size_t)w;
+      } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;  // loopback drains quickly
+      } else {
+        break;
+      }
+    }
+  }
+
+  void run() {
+    std::unordered_map<int, SseServerConn> conns;
+    std::vector<double> local_lat;
+    while (!stop_.load()) {
+      std::vector<pollfd> pfds;
+      pfds.push_back({listen_fd_, POLLIN, 0});
+      double now = now_realtime_ms();
+      double min_wait = 5.0;  // cap loop latency so stop() is responsive
+      for (auto& kv : conns) {
+        SseServerConn& c = kv.second;
+        short ev = 0;
+        if (!c.headers_sent) {
+          ev |= POLLIN;  // still reading the request line
+        } else if (!c.finished) {
+          double dl = c.start + prefill_ms_ + c.next_chunk * cadence_ms_;
+          double w = dl - now;
+          if (w < min_wait) min_wait = w;  // wake in time for next emit
+        }
+        pfds.push_back({kv.first, ev, 0});
+      }
+      int timeout = min_wait > 0.0 ? (int)min_wait : 0;
+      poll(pfds.data(), pfds.size(), timeout);
+
+      if (pfds[0].revents & POLLIN) {
+        while (true) {
+          int cfd = accept(listen_fd_, nullptr, nullptr);
+          if (cfd < 0) break;
+          set_nonblock(cfd);
+          int one = 1;
+          setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+          conns.emplace(cfd, SseServerConn{});
+        }
+      }
+
+      now = now_realtime_ms();
+      std::vector<int> to_close;
+      for (auto& kv : conns) {
+        int fd = kv.first;
+        SseServerConn& c = kv.second;
+        if (!c.headers_sent) {
+          char buf[4096];
+          ssize_t r = recv(fd, buf, sizeof(buf), 0);
+          if (r == 0) {
+            to_close.push_back(fd);
+          } else if (r > 0) {
+            c.reqbuf.append(buf, (size_t)r);
+            if (c.reqbuf.find("\r\n\r\n") != std::string::npos) {
+              send_all(fd, headers_);
+              c.headers_sent = true;
+              c.start = now_realtime_ms();
+            }
+          }
+          continue;
+        }
+        if (c.finished) continue;
+        while (c.next_chunk < num_chunks_) {
+          double dl = c.start + prefill_ms_ + c.next_chunk * cadence_ms_;
+          if (now < dl) break;  // not due yet
+          ssize_t w = ::send(fd, data_line_.data(), data_line_.size(), 0);
+          if (w < 0) break;  // EAGAIN: retry on the next tick
+          local_lat.push_back(now - dl);  // emit lateness = server jitter
+          c.next_chunk++;
+        }
+        if (c.next_chunk >= num_chunks_) {
+          ::send(fd, done_line_.data(), done_line_.size(), 0);
+          c.finished = true;
+          to_close.push_back(fd);
+        }
+      }
+      for (int fd : to_close) {
+        close(fd);
+        conns.erase(fd);
+      }
+      if (local_lat.size() >= 512) {
+        std::lock_guard<std::mutex> g(lat_mutex_);
+        lateness_.insert(lateness_.end(), local_lat.begin(), local_lat.end());
+        local_lat.clear();
+      }
+    }
+    {
+      std::lock_guard<std::mutex> g(lat_mutex_);
+      lateness_.insert(lateness_.end(), local_lat.begin(), local_lat.end());
+    }
+    for (auto& kv : conns) close(kv.first);
+  }
+
+  int num_chunks_;
+  double cadence_ms_, prefill_ms_;
+  int chunk_bytes_;
+  int listen_fd_ = -1, port_ = 0;
+  std::string data_line_, done_line_, headers_;
+  std::thread thread_;
+  std::atomic<bool> stop_{false};
+  std::mutex lat_mutex_;
+  std::vector<double> lateness_;
+};
+
 PYBIND11_MODULE(veeksha_native, m, py::mod_gil_not_used()) {
   m.doc() = "Native (C++) streaming receive path for Veeksha.";
   m.def("receive", &py_receive, py::arg("host"), py::arg("port"),
@@ -1243,4 +1447,20 @@ PYBIND11_MODULE(veeksha_native, m, py::mod_gil_not_used()) {
         "its own message sequence + paced send schedule, so N distinct realtime "
         "requests run concurrently over one poll() loop. Returns a WsResult per "
         "request (index-aligned to req_messages).");
+
+  py::class_<NativeSseServer>(m, "NativeSseServer")
+      .def(py::init<int, double, double, int>(), py::arg("num_chunks"),
+           py::arg("cadence_ms"), py::arg("prefill_ms") = 20.0,
+           py::arg("chunk_bytes") = 1)
+      .def("start", &NativeSseServer::start,
+           "Bind a loopback port, spawn the emit thread, return the port.")
+      .def("stop", &NativeSseServer::stop, "Stop the emit thread and close.")
+      .def("server_jitter_p99_ms", &NativeSseServer::server_jitter_p99_ms,
+           "p99 of per-chunk emit lateness (actual - scheduled) in ms.")
+      .doc() =
+      "Native reference SSE server: emits num_chunks per connection on absolute "
+      "realtime deadlines (prefill_ms + i*cadence_ms) from one poll loop with no "
+      "GIL/coroutine overhead, so its emit jitter is sub-ms. A validation tool "
+      "to measure the native client's true drift without the Python reference "
+      "server's punctuality floor.";
 }

@@ -36,6 +36,22 @@ def test_should_use_native_respects_flag_and_scheme():
     assert not should_use_native(_Cfg(True, "wss://api.example.com"))
 
 
+def test_resolve_native_threads_auto_and_override():
+    from veeksha.native.runner import (
+        _AUTO_SHARD_CONCURRENCY,
+        _resolve_native_threads,
+    )
+
+    # 0 = auto: single loop below the batching threshold, 2 shards at/above it.
+    assert _resolve_native_threads(0, 10) == 1
+    assert _resolve_native_threads(0, _AUTO_SHARD_CONCURRENCY - 1) == 1
+    assert _resolve_native_threads(0, _AUTO_SHARD_CONCURRENCY) == 2
+    assert _resolve_native_threads(0, 1600) == 2
+    # explicit value always wins over auto.
+    assert _resolve_native_threads(1, 1600) == 1
+    assert _resolve_native_threads(4, 10) == 4
+
+
 def _text_request(rid, tokens=10):
     from veeksha.core.request import Request
     from veeksha.core.request_content import TextChannelRequestContent

@@ -46,6 +46,21 @@ def _host_port(api_base: str) -> tuple[str, int]:
     return host, port
 
 
+# Concurrency at which a single poll loop services enough sockets per poll() that
+# userspace read-batching drift becomes visible; above it a second shard roughly
+# halves that drift (measured against a sub-ms native reference) while staying
+# safe against a co-located server. See analysis/15_drift_analysis.md.
+_AUTO_SHARD_CONCURRENCY = 200
+
+
+def _resolve_native_threads(configured: int, concurrency: int) -> int:
+    """Resolve native_threads, expanding 0 (=auto) by concurrency."""
+    configured = int(configured)
+    if configured > 0:
+        return configured
+    return 2 if concurrency >= _AUTO_SHARD_CONCURRENCY else 1
+
+
 def _client_task(client_config: Any) -> str:
     ctype = client_config.get_type()
     if ctype in _TEXT_TYPES:
@@ -107,7 +122,9 @@ def execute_native(
     host, port = _host_port(client_config.api_base or "http://127.0.0.1:80")
     transport = NativeTransport(host, port)
     task = _client_task(client_config)
-    num_threads = max(1, int(getattr(client_config, "native_threads", 1)))
+    num_threads = _resolve_native_threads(
+        getattr(client_config, "native_threads", 0), concurrency
+    )
     if task == "text":
         return transport.run_text(
             requests,

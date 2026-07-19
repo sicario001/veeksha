@@ -50,12 +50,14 @@ class BaseClientConfig(BasePolyConfig):
         "Falls back to the Python transport otherwise (e.g. https/wss).",
     )
     native_threads: int = field(
-        1,
+        0,
         help="Number of native poll-loop threads to shard connections across "
-        "(true parallel on free-threaded CPython). 1 is plenty until a single "
-        "loop is CPU-bound (~1600 streams); raise it only when the server is on "
-        "its own host, or the extra threads just steal cores from a co-located "
-        "server. Only used when use_native_transport is set.",
+        "(true parallel on free-threaded CPython). 0 = auto: 1 loop below ~200 "
+        "concurrent streams, 2 above it — sharding roughly halves userspace "
+        "read-batching drift once a single loop services many sockets per poll, "
+        "while 2 threads stays safe even against a co-located server. Set an "
+        "explicit value to override; raise it further only when the server is on "
+        "its own host. Only used when use_native_transport is set.",
     )
 
     def __post_init__(self):
