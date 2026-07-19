@@ -110,6 +110,71 @@ class NativeReceiveEngine:
             )
         return results
 
+    def run_chains(
+        self,
+        chains: List[List[NativeRequest]],
+        concurrency: int,
+        timeout_s: float = 120.0,
+        modality: ChannelModality = ChannelModality.TEXT,
+    ) -> List["NativeChainResult"]:
+        """Closed-loop / dependent workloads: each chain is a sequence of turns
+        where turn N+1 is dispatched only after turn N completes.
+
+        Native fires each next turn the instant the prior completes (no Python on
+        the receive->dispatch path) and reports per-turn TimedEventStreams plus
+        ``handoff_s`` — the native-measured inter-turn coupling latency, which is
+        the number that would otherwise be corrupted by Python queue jitter.
+        """
+        wire = [[req.to_wire(self.host) for req in chain] for chain in chains]
+        raw = _ext.run_chains(self.host, self.port, wire, concurrency, timeout_s)
+        results: List[NativeChainResult] = []
+        for item in raw:
+            turns = []
+            for turn in item.turns:
+                events = [
+                    StreamEvent(offset_s=off / 1000.0, size=1, kind="output")
+                    for off in turn.offsets_ms
+                ]
+                turns.append(
+                    NativeTurn(
+                        status=turn.status,
+                        content=turn.content,
+                        stream=TimedEventStream(modality, events),
+                    )
+                )
+            results.append(
+                NativeChainResult(
+                    index=item.index,
+                    turns=turns,
+                    handoff_s=[h / 1000.0 for h in item.handoff_ms],
+                    error=item.error,
+                )
+            )
+        return results
+
+
+@dataclass
+class NativeTurn:
+    """One turn's outcome within a dependent chain."""
+
+    status: int
+    content: str
+    stream: TimedEventStream
+
+
+@dataclass
+class NativeChainResult:
+    """A dependent chain's per-turn results + native inter-turn handoff latency."""
+
+    index: int
+    turns: List[NativeTurn]
+    handoff_s: List[float] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def success(self) -> bool:
+        return not self.error and len(self.turns) > 0
+
 
 @dataclass
 class NativeWsResult:

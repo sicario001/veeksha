@@ -409,6 +409,211 @@ static std::vector<ReqResult> py_run_batch(const std::string& host, int port,
 }
 
 // ===========================================================================
+// Native receive->dispatch coupling (P6): closed-loop / dependent workloads.
+// Each "chain" is a sequence of turns (turn N+1 depends on turn N completing).
+// Native runs many chains concurrently; the instant a turn completes it fires
+// the chain's next turn itself — Python is never on the receive->dispatch
+// critical path — and records the handoff latency (turn-complete -> next-send).
+// This is the coupling the docs (analysis/11 correction) require to be native so
+// closed-loop dispatch timing isn't corrupted by Python queue jitter.
+// ===========================================================================
+
+struct ChainTurn {
+  std::vector<double> offsets_ms;
+  std::string content;
+  int status = 0;
+};
+
+struct ChainResult {
+  int index = -1;
+  std::vector<ChainTurn> turns;
+  std::vector<double> handoff_ms;  // per-inter-turn: complete -> next send
+  std::string error;
+};
+
+struct ChainConn {
+  int chain = -1;
+  size_t turn = 0;
+  bool connected = false;
+  bool headers_done = false;
+  bool done = false;
+  double send_time = 0.0;
+  int status = 0;
+  std::string header_buf;
+  std::string inbuf;
+  std::string content;
+  std::vector<double> offsets;
+};
+
+static std::vector<ChainResult> run_chains(
+    const std::string& host, int port,
+    const std::vector<std::vector<std::string>>& chains, int concurrency,
+    double timeout_s) {
+  struct rlimit rl;
+  getrlimit(RLIMIT_NOFILE, &rl);
+  rl.rlim_cur = std::max<rlim_t>(rl.rlim_cur, (rlim_t)(concurrency + 64));
+  if (rl.rlim_cur > rl.rlim_max) rl.rlim_cur = rl.rlim_max;
+  setrlimit(RLIMIT_NOFILE, &rl);
+
+  int total = (int)chains.size();
+  std::vector<ChainResult> results(total);
+  for (int i = 0; i < total; i++) results[i].index = i;
+
+  std::unordered_map<int, ChainConn> conns;
+  std::vector<double> last_complete(total, 0.0);  // when a chain's last turn ended
+  int next_chain = 0;
+  int chains_done = 0;
+
+  // Launch turn `turn` of chain `ch` on a fresh connection.
+  auto launch_turn = [&](int ch, size_t turn) -> bool {
+    int fd = make_conn(host, port);
+    if (fd < 0) {
+      results[ch].error = "connect failed";
+      return false;
+    }
+    ChainConn c;
+    c.chain = ch;
+    c.turn = turn;
+    conns.emplace(fd, std::move(c));
+    return true;
+  };
+
+  auto start_next_chain = [&]() {
+    while ((int)conns.size() < concurrency && next_chain < total) {
+      int ch = next_chain++;
+      if (chains[ch].empty()) {
+        chains_done++;
+        continue;
+      }
+      launch_turn(ch, 0);
+    }
+  };
+  start_next_chain();
+
+  double t0 = now_ms();
+  while (chains_done < total && (now_ms() - t0) < timeout_s * 1000.0) {
+    std::vector<struct pollfd> pfds;
+    pfds.reserve(conns.size());
+    for (auto& kv : conns) {
+      struct pollfd pp;
+      pp.fd = kv.first;
+      pp.events = kv.second.connected ? POLLIN : POLLOUT;
+      pp.revents = 0;
+      pfds.push_back(pp);
+    }
+    if (pfds.empty()) break;
+    int n = poll(pfds.data(), pfds.size(), 50);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    std::vector<int> to_close;
+    for (auto& pp : pfds) {
+      auto it = conns.find(pp.fd);
+      if (it == conns.end()) continue;
+      ChainConn& c = it->second;
+      if (!c.connected && (pp.revents & (POLLOUT | POLLERR | POLLHUP))) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        getsockopt(pp.fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err != 0) {
+          results[c.chain].error = "connect error";
+          chains_done++;
+          to_close.push_back(pp.fd);
+          continue;
+        }
+        c.connected = true;
+        c.send_time = now_ms();
+        const std::string& req = chains[c.chain][c.turn];
+        send(pp.fd, req.data(), req.size(), 0);
+      } else if (c.connected && (pp.revents & POLLIN)) {
+        char buf[16384];
+        ssize_t r = recv(pp.fd, buf, sizeof(buf), 0);
+        if (r > 0) {
+          if (!c.headers_done) {
+            c.header_buf.append(buf, r);
+            size_t term = c.header_buf.find("\r\n\r\n");
+            if (term != std::string::npos) {
+              size_t sp = c.header_buf.find(' ');
+              if (sp != std::string::npos) c.status = atoi(c.header_buf.c_str() + sp + 1);
+              c.inbuf = c.header_buf.substr(term + 4);
+              c.headers_done = true;
+              EngineConn tmp;  // reuse the SSE line parser
+              tmp.send_time = c.send_time;
+              tmp.inbuf = c.inbuf;
+              parse_body_sse(tmp);
+              c.inbuf = tmp.inbuf;
+              c.content += tmp.content;
+              for (double o : tmp.offsets) c.offsets.push_back(o);
+              if (tmp.done) c.done = true;
+            }
+          } else {
+            EngineConn tmp;
+            tmp.send_time = c.send_time;
+            tmp.inbuf = c.inbuf;
+            tmp.inbuf.append(buf, r);
+            parse_body_sse(tmp);
+            c.inbuf = tmp.inbuf;
+            c.content += tmp.content;
+            for (double o : tmp.offsets) c.offsets.push_back(o);
+            if (tmp.done) c.done = true;
+          }
+          if (c.done) to_close.push_back(pp.fd);
+        } else if (r == 0) {
+          to_close.push_back(pp.fd);
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+          results[c.chain].error = "recv error";
+          to_close.push_back(pp.fd);
+        }
+      } else if (pp.revents & (POLLERR | POLLHUP)) {
+        to_close.push_back(pp.fd);
+      }
+    }
+    for (int fd : to_close) {
+      auto it = conns.find(fd);
+      if (it == conns.end()) continue;
+      ChainConn c = std::move(it->second);
+      close(fd);
+      conns.erase(it);
+
+      double complete_at = now_ms();
+      ChainTurn ct;
+      ct.offsets_ms = std::move(c.offsets);
+      ct.content = std::move(c.content);
+      ct.status = c.status;
+      results[c.chain].turns.push_back(std::move(ct));
+
+      size_t next_turn = c.turn + 1;
+      if (next_turn < chains[c.chain].size()) {
+        // COUPLING: fire the dependent next turn immediately, in native, and
+        // record the handoff latency (no Python between receive and dispatch).
+        last_complete[c.chain] = complete_at;
+        if (launch_turn(c.chain, next_turn)) {
+          // the new conn's send happens on POLLOUT; approximate handoff as the
+          // time from completion to the connect being issued (native-side).
+          results[c.chain].handoff_ms.push_back(now_ms() - complete_at);
+        } else {
+          chains_done++;
+        }
+      } else {
+        chains_done++;
+      }
+    }
+    start_next_chain();
+  }
+  for (auto& kv : conns) close(kv.first);
+  return results;
+}
+
+static std::vector<ChainResult> py_run_chains(
+    const std::string& host, int port,
+    const std::vector<std::vector<std::string>>& chains, int concurrency,
+    double timeout_s) {
+  py::gil_scoped_release release;
+  return run_chains(host, port, chains, concurrency, timeout_s);
+}
+
+// ===========================================================================
 // Native WebSocket receive + framed send (P3): the interactivity-critical path.
 // Connects, performs the HTTP Upgrade handshake, sends caller-provided text
 // messages as masked frames, and reads server text/binary frames — timestamping
@@ -704,6 +909,24 @@ PYBIND11_MODULE(veeksha_native, m, py::mod_gil_not_used()) {
         "Real per-request engine: owns connection concurrency over one poll() "
         "loop, sends caller-built HTTP requests, returns per-request ReqResult "
         "(status, content, kernel-time chunk offsets_ms + sizes).");
+
+  py::class_<ChainTurn>(m, "ChainTurn")
+      .def_readonly("offsets_ms", &ChainTurn::offsets_ms)
+      .def_readonly("content", &ChainTurn::content)
+      .def_readonly("status", &ChainTurn::status);
+
+  py::class_<ChainResult>(m, "ChainResult")
+      .def_readonly("index", &ChainResult::index)
+      .def_readonly("turns", &ChainResult::turns)
+      .def_readonly("handoff_ms", &ChainResult::handoff_ms)
+      .def_readonly("error", &ChainResult::error);
+
+  m.def("run_chains", &py_run_chains, py::arg("host"), py::arg("port"),
+        py::arg("chains"), py::arg("concurrency"), py::arg("timeout_s") = 120.0,
+        "Closed-loop coupling: each chain is a sequence of dependent turns; "
+        "native fires each next turn the instant the prior completes (no Python "
+        "on the receive->dispatch path) and records per-turn timelines + the "
+        "inter-turn handoff latency.");
 
   py::class_<WsResult>(m, "WsResult")
       .def_readonly("index", &WsResult::index)
