@@ -28,6 +28,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -273,49 +274,42 @@ static void parse_body_sse(EngineConn& c) {
   }
 }
 
-static std::vector<ReqResult> run_batch(const std::string& host, int port,
-                                        const std::vector<std::string>& requests,
-                                        int concurrency, double timeout_s, bool sse,
-                                        const std::vector<double>& dispatch_offsets_ms) {
-  struct rlimit rl;
-  getrlimit(RLIMIT_NOFILE, &rl);
-  rl.rlim_cur = std::max<rlim_t>(rl.rlim_cur, (rlim_t)(concurrency + 64));
-  if (rl.rlim_cur > rl.rlim_max) rl.rlim_cur = rl.rlim_max;
-  setrlimit(RLIMIT_NOFILE, &rl);
-
-  int total = (int)requests.size();
-  std::vector<ReqResult> results(total);
-  for (int i = 0; i < total; i++) results[i].index = i;
-
+// One shard's poll() loop: services the request indices in `indices` with up to
+// `concurrency` in-flight, writing into results[idx] (disjoint per shard, so
+// threads never touch the same element — no hot-path locks). `t0` is shared
+// across shards so open-loop arrival deadlines line up on one global clock.
+static void run_batch_worker(const std::string& host, int port,
+                             const std::vector<std::string>& requests,
+                             const std::vector<int>& indices, int concurrency,
+                             double timeout_s, bool sse,
+                             const std::vector<double>& dispatch_offsets_ms,
+                             double t0, std::vector<ReqResult>& results) {
+  int total = (int)indices.size();
   std::unordered_map<int, EngineConn> conns;
-  int launched = 0, completed = 0;
-  double t0 = now_ms();
+  size_t cur = 0;
+  int completed = 0;
   bool open_loop = !dispatch_offsets_ms.empty();
 
-  // Closed-loop (no offsets): fill to `concurrency` and refill on completion.
-  // Open-loop (offsets given): launch request i at its arrival deadline
-  // dispatch_offsets_ms[i], with `concurrency` as a max-in-flight safety cap —
-  // native owns the arrival-dispatch timing (kernel-time send on the schedule).
-  // Returns ms until the next pending dispatch deadline (open-loop) or 0.
   auto try_launch = [&]() -> double {
     double now = now_ms() - t0;
-    while ((int)conns.size() < concurrency && launched < total) {
-      if (open_loop && dispatch_offsets_ms[launched] > now + 0.05) {
-        return dispatch_offsets_ms[launched] - now;  // not due yet
+    while ((int)conns.size() < concurrency && cur < indices.size()) {
+      int idx = indices[cur];
+      if (open_loop && dispatch_offsets_ms[idx] > now + 0.05) {
+        return dispatch_offsets_ms[idx] - now;  // not due yet
       }
       int fd = make_conn(host, port);
       if (fd < 0) {
-        results[launched].error = "connect failed";
+        results[idx].error = "connect failed";
         completed++;
-        launched++;
+        cur++;
         continue;
       }
       EngineConn c;
-      c.index = launched;
+      c.index = idx;
       c.sse = sse;
-      results[launched].dispatch_offset_ms = now_ms() - t0;
+      results[idx].dispatch_offset_ms = now_ms() - t0;
       conns.emplace(fd, std::move(c));
-      launched++;
+      cur++;
     }
     return 1e9;
   };
@@ -331,8 +325,6 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
       p.revents = 0;
       pfds.push_back(p);
     }
-    // Wake in time for the next arrival deadline (open-loop) so dispatch is
-    // punctual rather than waiting the full 50ms poll tick.
     int poll_ms = 50;
     if (open_loop && next_dispatch < poll_ms) poll_ms = (int)std::max(0.0, next_dispatch);
     int n = poll(pfds.data(), pfds.size(), poll_ms);
@@ -398,7 +390,6 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
       res.offsets_ms = std::move(c.offsets);
       res.sizes = std::move(c.sizes);
       if (!c.sse) {
-        // non-streaming: one event at completion time for the whole body
         res.offsets_ms.push_back(now_ms() - c.send_time);
         res.sizes.push_back((int)res.content.size());
       }
@@ -409,21 +400,71 @@ static std::vector<ReqResult> run_batch(const std::string& host, int port,
     next_dispatch = try_launch();
   }
   for (auto& kv : conns) {
-    // timed out mid-flight
     ReqResult& res = results[kv.second.index];
     if (res.error.empty()) res.error = "timeout";
     close(kv.first);
   }
+}
+
+// Public engine: shards the requests across `num_threads` native poll-loop
+// threads (each its own loop over a disjoint socket set) and merges. On
+// free-threaded CPython the loops run in true parallel (no Python in the hot
+// path), so one native process scales past a single loop's CPU limit — the
+// standard sharded-reactor pattern (nginx/envoy). `num_threads<=1` = one loop.
+static std::vector<ReqResult> run_batch(const std::string& host, int port,
+                                        const std::vector<std::string>& requests,
+                                        int concurrency, double timeout_s, bool sse,
+                                        const std::vector<double>& dispatch_offsets_ms,
+                                        int num_threads) {
+  struct rlimit rl;
+  getrlimit(RLIMIT_NOFILE, &rl);
+  rl.rlim_cur = std::max<rlim_t>(rl.rlim_cur, (rlim_t)(concurrency + 64));
+  if (rl.rlim_cur > rl.rlim_max) rl.rlim_cur = rl.rlim_max;
+  setrlimit(RLIMIT_NOFILE, &rl);
+
+  int total = (int)requests.size();
+  std::vector<ReqResult> results(total);
+  for (int i = 0; i < total; i++) results[i].index = i;
+  if (total == 0) return results;
+
+  int nthreads = std::max(1, num_threads);
+  if (nthreads > total) nthreads = total;
+  double t0 = now_ms();
+
+  if (nthreads == 1) {
+    std::vector<int> all(total);
+    for (int i = 0; i < total; i++) all[i] = i;
+    run_batch_worker(host, port, requests, all, concurrency, timeout_s, sse,
+                     dispatch_offsets_ms, t0, results);
+    return results;
+  }
+
+  // Strided sharding spreads the arrival schedule evenly across threads (thread
+  // t owns indices t, t+N, t+2N, ...). Split the in-flight budget across shards.
+  std::vector<std::vector<int>> shards(nthreads);
+  for (int i = 0; i < total; i++) shards[i % nthreads].push_back(i);
+  int per_thread_conc = (concurrency + nthreads - 1) / nthreads;
+  if (per_thread_conc < 1) per_thread_conc = 1;
+
+  std::vector<std::thread> pool;
+  pool.reserve(nthreads);
+  for (int t = 0; t < nthreads; t++) {
+    pool.emplace_back([&, t]() {
+      run_batch_worker(host, port, requests, shards[t], per_thread_conc,
+                       timeout_s, sse, dispatch_offsets_ms, t0, results);
+    });
+  }
+  for (auto& th : pool) th.join();
   return results;
 }
 
 static std::vector<ReqResult> py_run_batch(
     const std::string& host, int port,
     const std::vector<std::string>& requests, int concurrency, double timeout_s,
-    bool sse, const std::vector<double>& dispatch_offsets_ms) {
+    bool sse, const std::vector<double>& dispatch_offsets_ms, int num_threads) {
   py::gil_scoped_release release;
   return run_batch(host, port, requests, concurrency, timeout_s, sse,
-                   dispatch_offsets_ms);
+                   dispatch_offsets_ms, num_threads);
 }
 
 // ===========================================================================
@@ -1078,12 +1119,15 @@ PYBIND11_MODULE(veeksha_native, m, py::mod_gil_not_used()) {
         py::arg("requests"), py::arg("concurrency"), py::arg("timeout_s") = 120.0,
         py::arg("sse") = true,
         py::arg("dispatch_offsets_ms") = std::vector<double>(),
-        "Real per-request engine: owns connection concurrency over one poll() "
-        "loop, sends caller-built HTTP requests, returns per-request ReqResult "
+        py::arg("num_threads") = 1,
+        "Real per-request engine: owns connection concurrency over poll() "
+        "loop(s), sends caller-built HTTP requests, returns per-request ReqResult "
         "(status, content, kernel-time chunk offsets_ms + sizes, actual "
         "dispatch_offset_ms). With dispatch_offsets_ms it runs OPEN-LOOP: each "
         "request is launched on its arrival deadline (concurrency = max in-flight "
-        "cap) so native owns the arrival-dispatch timing too.");
+        "cap) so native owns the arrival-dispatch timing too. num_threads>1 shards "
+        "the connections across that many native poll-loop threads (true parallel "
+        "on free-threaded CPython), splitting the in-flight budget across shards.");
 
   py::class_<ChainTurn>(m, "ChainTurn")
       .def_readonly("offsets_ms", &ChainTurn::offsets_ms)

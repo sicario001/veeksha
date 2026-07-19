@@ -105,6 +105,7 @@ class NativeReceiveEngine:
         timeout_s: float = 120.0,
         modality: ChannelModality = ChannelModality.TEXT,
         dispatch_offsets_s: Optional[List[float]] = None,
+        num_threads: int = 1,
     ) -> List[NativeResult]:
         """Send all requests (native owns concurrency); return per-request results.
 
@@ -116,13 +117,26 @@ class NativeReceiveEngine:
         is launched on its arrival deadline (rate-based traffic), with
         ``concurrency`` as a max-in-flight safety cap — so native owns the
         arrival-dispatch timing, not just the receive timing.
+
+        ``num_threads`` > 1 shards the connections across that many native
+        poll-loop threads (true parallel on free-threaded CPython), splitting the
+        in-flight budget across shards. Only helps when a single loop is
+        CPU-bound; give the server its own host first (co-located, extra threads
+        just steal cores from the server).
         """
         wire = [r.to_wire(self.host) for r in requests]
         offsets_ms = (
             [s * 1000.0 for s in dispatch_offsets_s] if dispatch_offsets_s else []
         )
         raw = _ext.run_batch(
-            self.host, self.port, wire, concurrency, timeout_s, sse, offsets_ms
+            self.host,
+            self.port,
+            wire,
+            concurrency,
+            timeout_s,
+            sse,
+            offsets_ms,
+            num_threads,
         )
         results: List[NativeResult] = []
         for item in raw:

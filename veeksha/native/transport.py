@@ -59,6 +59,7 @@ class NativeTransport:
         default_max_tokens: int = 16,
         timeout_s: float = 120.0,
         dispatch_offsets_s: Optional[List[float]] = None,
+        num_threads: int = 1,
     ) -> List[RequestResult]:
         native_reqs = []
         for request in requests:
@@ -87,6 +88,7 @@ class NativeTransport:
             timeout_s=timeout_s,
             modality=ChannelModality.TEXT,
             dispatch_offsets_s=dispatch_offsets_s,
+            num_threads=num_threads,
         )
         out = []
         for request, res in zip(requests, results):

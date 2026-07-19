@@ -20,6 +20,8 @@ try:
             "veeksha.native.veeksha_native",
             ["veeksha/native/src/native_receiver.cpp"],
             cxx_std=17,
+            extra_compile_args=["-pthread"],
+            extra_link_args=["-pthread"],
         )
     ]
 except Exception:  # pragma: no cover - pybind11 missing at build time

@@ -107,6 +107,7 @@ def execute_native(
     host, port = _host_port(client_config.api_base or "http://127.0.0.1:80")
     transport = NativeTransport(host, port)
     task = _client_task(client_config)
+    num_threads = max(1, int(getattr(client_config, "native_threads", 1)))
     if task == "text":
         return transport.run_text(
             requests,
@@ -114,6 +115,7 @@ def execute_native(
             model=getattr(client_config, "model", "dummy") or "dummy",
             timeout_s=timeout_s,
             dispatch_offsets_s=dispatch_offsets_s,
+            num_threads=num_threads,
         )
     if task == "tts":
         return transport.run_realtime_tts(

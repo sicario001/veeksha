@@ -15,7 +15,7 @@ SUF="$("$PY" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))
 OUT="$HERE/veeksha_native$SUF"
 
 echo "building $OUT"
-clang++ -O2 -std=c++17 -shared -fPIC -undefined dynamic_lookup \
+clang++ -O2 -std=c++17 -pthread -shared -fPIC -undefined dynamic_lookup \
   -I"$PYINC" -I"$PBINC" \
   "$HERE/src/native_receiver.cpp" -o "$OUT"
 echo "built $OUT"
