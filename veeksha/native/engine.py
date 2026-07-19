@@ -109,3 +109,75 @@ class NativeReceiveEngine:
                 )
             )
         return results
+
+
+@dataclass
+class NativeWsResult:
+    """One WebSocket connection's receive timeline + paced-send record."""
+
+    index: int
+    stream: TimedEventStream  # server frames, offsets in seconds from handshake
+    content: str
+    sent_offsets_s: List[float] = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def success(self) -> bool:
+        return not self.error and len(self.stream) > 0
+
+
+class NativeWsEngine:
+    """Native WebSocket transport: per-frame receive timing + timer-wheel sends.
+
+    The interactivity-critical path (per-token receive + per-chunk paced send)
+    owned entirely in C++: one poll() loop over all connections timestamps each
+    server frame at socket-read time and dispatches each client message on its
+    absolute deadline — Python is never in the per-event loop.
+    """
+
+    def __init__(self, host: str, port: int):
+        if _ext is None:
+            raise RuntimeError(
+                "veeksha_native not built; run veeksha/native/build.sh <python>"
+            )
+        self.host = host
+        self.port = port
+
+    def stream(
+        self,
+        path: str,
+        init_messages: List[str],
+        concurrency: int,
+        send_offsets_s: Optional[List[float]] = None,
+        timeout_s: float = 30.0,
+        modality: ChannelModality = ChannelModality.AUDIO,
+    ) -> List[NativeWsResult]:
+        """Open ``concurrency`` WS connections; send init_messages (paced by
+        ``send_offsets_s``, seconds from handshake, or all immediately) and
+        collect the server-frame receive timeline per connection."""
+        send_offsets_ms = [s * 1000.0 for s in send_offsets_s] if send_offsets_s else []
+        raw = _ext.ws_stream(
+            self.host,
+            self.port,
+            path,
+            init_messages,
+            concurrency,
+            timeout_s,
+            send_offsets_ms,
+        )
+        results: List[NativeWsResult] = []
+        for item in raw:
+            events = [
+                StreamEvent(offset_s=off / 1000.0, size=size, kind="output")
+                for off, size in zip(item.offsets_ms, item.sizes)
+            ]
+            results.append(
+                NativeWsResult(
+                    index=item.index,
+                    stream=TimedEventStream(modality, events),
+                    content=item.content,
+                    sent_offsets_s=[o / 1000.0 for o in item.sent_offsets_ms],
+                    error=item.error,
+                )
+            )
+        return results
