@@ -78,3 +78,23 @@ def test_native_request_wire_format():
     assert "Host: example.com\r\n" in wire
     assert "Content-Length: 7\r\n" in wire
     assert wire.endswith('\r\n\r\n{"a":1}')
+
+
+def test_native_batch_receive_drift_is_honest():
+    """P5: the real native engine records the cadence with low per-chunk drift."""
+    from veeksha import native
+
+    engine = _dummy_engine(num_chunks=20)
+    try:
+        m = native.batch_receive_drift(
+            "127.0.0.1",
+            engine.port,
+            concurrency=100,
+            num_chunks=20,
+            chunk_ms=20.0,
+            total_requests=200,
+        )
+    finally:
+        engine.stop()
+    assert m["completed"] >= 190  # native owns concurrency; ~all complete
+    assert m["ivl_err_p99_ms"] < 20.0  # honest to the 20ms cadence

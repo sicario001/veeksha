@@ -71,3 +71,53 @@ def receive_drift(
         "ivl_err_p99_ms": _pct(ivl_err, 99),
         "stretch_p99": _pct(stretch, 99),
     }
+
+
+def batch_receive_drift(
+    host: str,
+    port: int,
+    concurrency: int,
+    num_chunks: int,
+    chunk_ms: float,
+    total_requests: int,
+    timeout_s: float = 120.0,
+) -> Dict[str, float]:
+    """Per-chunk receive drift through the REAL native engine (run_batch).
+
+    Unlike ``receive_drift`` (the standalone probe), this drives the production
+    native engine — real per-request send/receive that owns connection
+    concurrency — and reports how faithfully it recorded the known cadence via
+    the same TimedEventStream metrics the Python pipeline uses. This is the
+    engine that would back an integrated native transport, so its drift is the
+    honest measure of the native path (P5 sufficiency).
+    """
+    from veeksha.native.engine import NativeReceiveEngine, NativeRequest
+
+    if _ext is None:
+        raise RuntimeError(
+            "veeksha_native not built; run veeksha/native/build.sh <python>"
+        )
+    body = '{"model":"d","stream":true,"max_completion_tokens":' + str(num_chunks) + "}"
+    requests = [
+        NativeRequest(path="/v1/chat/completions", body=body)
+        for _ in range(total_requests)
+    ]
+    engine = NativeReceiveEngine(host, port)
+    results = engine.run(requests, concurrency=concurrency, timeout_s=timeout_s)
+
+    ok = [r for r in results if r.success]
+    lo = int(0.10 * len(ok))
+    window = ok[lo:]
+    chunk_dt_s = chunk_ms / 1000.0
+    ivl_err: List[float] = []
+    for r in window:
+        if len(r.stream) < 2:
+            continue
+        for d in r.stream.inter_event_deltas():
+            ivl_err.append(abs(d - chunk_dt_s) * 1000.0)  # ms
+    return {
+        "concurrency": float(concurrency),
+        "completed": float(len(ok)),
+        "measured": float(len(window)),
+        "ivl_err_p99_ms": _pct(ivl_err, 99),
+    }
