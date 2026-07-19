@@ -49,6 +49,27 @@ class MockRealtimeTTSServer:
         self._lat_lock = threading.Lock()
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._threads: List[threading.Thread] = []
+        # Pre-serialize every repeated message ONCE: the audio delta is identical
+        # for every chunk of every connection, so json.dumps-per-chunk is pure
+        # wasted CPU on the emit loop (and shows up as server jitter). Do it here.
+        encoded = base64.b64encode(b"\x00" * chunk_bytes).decode("ascii")
+        self._delta_msg = json.dumps(
+            {"type": "response.output_audio.delta", "delta": encoded}
+        )
+        self._audio_done_msg = json.dumps({"type": "response.output_audio.done"})
+        self._response_done_msg = json.dumps(
+            {"type": "response.done", "response": {"status": "completed"}}
+        )
+        self._session_updated_msg = json.dumps(
+            {
+                "type": "session.updated",
+                "session": {
+                    "audio": {
+                        "output": {"format": {"type": "audio/pcm", "rate": sample_rate}}
+                    }
+                },
+            }
+        )
 
     def server_jitter_p99_ms(self) -> float:
         with self._lat_lock:
@@ -63,8 +84,6 @@ class MockRealtimeTTSServer:
 
     async def _emit_audio(self, ws) -> None:
         await ws.send(json.dumps({"type": "response.created"}))
-        pcm = b"\x00" * self.chunk_bytes
-        encoded = base64.b64encode(pcm).decode("ascii")
         start = time.monotonic()
         for i in range(self.num_chunks):
             scheduled = start + self.first_delta_delay + i * self.delta_dt
@@ -74,20 +93,12 @@ class MockRealtimeTTSServer:
             with self._lat_lock:
                 self._emit_lateness_ms.append((time.monotonic() - scheduled) * 1000.0)
             try:
-                await ws.send(
-                    json.dumps(
-                        {"type": "response.output_audio.delta", "delta": encoded}
-                    )
-                )
+                await ws.send(self._delta_msg)  # pre-serialized once (see __init__)
             except Exception:
                 return
         try:
-            await ws.send(json.dumps({"type": "response.output_audio.done"}))
-            await ws.send(
-                json.dumps(
-                    {"type": "response.done", "response": {"status": "completed"}}
-                )
-            )
+            await ws.send(self._audio_done_msg)
+            await ws.send(self._response_done_msg)
             await ws.close()  # terminal: let clients stop promptly
         except Exception:
             pass
@@ -102,23 +113,7 @@ class MockRealtimeTTSServer:
                     continue
                 etype = event.get("type") if isinstance(event, dict) else None
                 if etype == "session.update":
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "session.updated",
-                                "session": {
-                                    "audio": {
-                                        "output": {
-                                            "format": {
-                                                "type": "audio/pcm",
-                                                "rate": self.sample_rate,
-                                            }
-                                        }
-                                    }
-                                },
-                            }
-                        )
-                    )
+                    await ws.send(self._session_updated_msg)
                 elif etype == "response.create":
                     audio_task = asyncio.ensure_future(self._emit_audio(ws))
                 # conversation.item.create: text deltas, just drained.

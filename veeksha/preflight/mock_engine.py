@@ -39,6 +39,10 @@ class MockStreamingEngine:
         self.host = host
         self.num_loops = num_loops
         self.port: int = 0
+        # Pre-serialize the (identical) SSE data line once, so the emit loop does
+        # no per-chunk json.dumps — keeps the server's emit lateness low.
+        _payload = json.dumps({"choices": [{"index": 0, "delta": {"content": "x"}}]})
+        self._data_line = f"data: {_payload}\n".encode()
         self._threads: List[threading.Thread] = []
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._emit_lateness_ms: List[float] = []
@@ -105,8 +109,7 @@ class MockStreamingEngine:
                 await asyncio.sleep(scheduled - now)
             with self._lat_lock:
                 self._emit_lateness_ms.append((time.monotonic() - scheduled) * 1000.0)
-            payload = json.dumps({"choices": [{"index": 0, "delta": {"content": "x"}}]})
-            writer.write(f"data: {payload}\n".encode())
+            writer.write(self._data_line)  # pre-serialized once (see __init__)
             try:
                 await writer.drain()
             except ConnectionResetError, BrokenPipeError:

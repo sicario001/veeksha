@@ -13,6 +13,7 @@ import base64
 import json
 import socket
 import threading
+import time
 from typing import List, Optional, Tuple
 
 import websockets
@@ -29,6 +30,7 @@ class MockRealtimeAudioServer:
         chunk_dt: float = 0.02,
         sample_rate: int = 24000,
         host: str = "127.0.0.1",
+        num_loops: int = 8,
     ):
         self.num_chunks = num_chunks
         self.chunk_bytes = chunk_bytes
@@ -36,38 +38,60 @@ class MockRealtimeAudioServer:
         self.chunk_dt = chunk_dt
         self.sample_rate = sample_rate
         self.host = host
+        self.num_loops = num_loops
         self.port: int = 0
+        self._emit_lateness_ms: List[float] = []
+        self._lat_lock = threading.Lock()
+        # Pre-serialize repeated messages once (identical for every chunk/conn).
+        encoded = base64.b64encode(b"\x00" * chunk_bytes).decode("ascii")
+        self._delta_msg = json.dumps(
+            {"type": "response.output_audio.delta", "delta": encoded}
+        )
+        self._audio_done_msg = json.dumps({"type": "response.output_audio.done"})
+        self._response_done_msg = json.dumps(
+            {"type": "response.done", "response": {"status": "completed"}}
+        )
+        self._session_updated_msg = json.dumps(
+            {
+                "type": "session.updated",
+                "session": {
+                    "audio": {
+                        "output": {"format": {"type": "audio/pcm", "rate": sample_rate}}
+                    }
+                },
+            }
+        )
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._threads: List[threading.Thread] = []
 
+    def server_jitter_p99_ms(self) -> float:
+        with self._lat_lock:
+            xs = sorted(self._emit_lateness_ms)
+        if not xs:
+            return 0.0
+        return xs[min(len(xs) - 1, int(round(0.99 * (len(xs) - 1))))]
+
+    def reset_telemetry(self) -> None:
+        with self._lat_lock:
+            self._emit_lateness_ms.clear()
+
     async def _emit_audio(self, ws) -> None:
         await ws.send(json.dumps({"type": "response.created"}))
-        pcm = b"\x00" * self.chunk_bytes
-        encoded = base64.b64encode(pcm).decode("ascii")
-        # Absolute-deadline schedule so send backpressure never accumulates drift
-        # into the emitted cadence (the server must be the honest reference).
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.first_delta_delay
-        for _ in range(self.num_chunks):
-            sleep_s = deadline - loop.time()
-            if sleep_s > 0:
-                await asyncio.sleep(sleep_s)
+        start = time.monotonic()
+        for i in range(self.num_chunks):
+            scheduled = start + self.first_delta_delay + i * self.chunk_dt
+            now = time.monotonic()
+            if scheduled > now:
+                await asyncio.sleep(scheduled - now)
+            with self._lat_lock:
+                self._emit_lateness_ms.append((time.monotonic() - scheduled) * 1000.0)
             try:
-                await ws.send(
-                    json.dumps(
-                        {"type": "response.output_audio.delta", "delta": encoded}
-                    )
-                )
+                await ws.send(self._delta_msg)  # pre-serialized
             except Exception:
                 return
-            deadline += self.chunk_dt
         try:
-            await ws.send(json.dumps({"type": "response.output_audio.done"}))
-            await ws.send(
-                json.dumps(
-                    {"type": "response.done", "response": {"status": "completed"}}
-                )
-            )
+            await ws.send(self._audio_done_msg)
+            await ws.send(self._response_done_msg)
         except Exception:
             pass
 
@@ -81,23 +105,7 @@ class MockRealtimeAudioServer:
                     continue
                 etype = event.get("type") if isinstance(event, dict) else None
                 if etype == "session.update":
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "session.updated",
-                                "session": {
-                                    "audio": {
-                                        "output": {
-                                            "format": {
-                                                "type": "audio/pcm",
-                                                "rate": self.sample_rate,
-                                            }
-                                        }
-                                    }
-                                },
-                            }
-                        )
-                    )
+                    await ws.send(self._session_updated_msg)
                 elif etype == "response.create":
                     audio_task = asyncio.ensure_future(self._emit_audio(ws))
         except Exception:
@@ -111,17 +119,19 @@ class MockRealtimeAudioServer:
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
         s.close()
-        ready = threading.Event()
+        readies = [threading.Event() for _ in range(self.num_loops)]
 
-        def _run():
+        def _run(idx: int):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             stop_ev = asyncio.Event()
             self._stoppers.append((loop, stop_ev))
 
             async def _main():
-                async with websockets.serve(self._handler, self.host, self.port):
-                    ready.set()
+                async with websockets.serve(
+                    self._handler, self.host, self.port, reuse_port=True
+                ):
+                    readies[idx].set()
                     await stop_ev.wait()
 
             try:
@@ -129,10 +139,14 @@ class MockRealtimeAudioServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="preflight-audio")
-        t.start()
-        self._threads.append(t)
-        ready.wait(timeout=5.0)
+        for i in range(self.num_loops):
+            t = threading.Thread(
+                target=_run, args=(i,), daemon=True, name="preflight-audio"
+            )
+            t.start()
+            self._threads.append(t)
+        for r in readies:
+            r.wait(timeout=5.0)
         return self
 
     def stop(self) -> None:
@@ -173,37 +187,36 @@ class MockSTTPreflightServer:
         # per-connection append-arrival offsets (ms from that conn's first append)
         self.append_arrivals: List[List[float]] = []
         self._arr_lock = threading.Lock()
+        # Pre-serialize the (fixed) transcript messages once so the emit loop is
+        # cheap and doesn't steal cycles from receiving/timestamping appends.
+        words = transcript.split()
+        self._created_msg = json.dumps({"type": "session.created"})
+        self._delta_msgs = [
+            json.dumps({"type": "transcription.delta", "delta": (" " + w if i else w)})
+            for i, w in enumerate(words)
+        ]
+        self._done_msg = json.dumps({"type": "transcription.done", "text": transcript})
         self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
         self._threads: List[threading.Thread] = []
 
     async def _handler(self, ws) -> None:
         import time
 
-        await ws.send(json.dumps({"type": "session.created"}))
-        words = self.transcript.split()
+        await ws.send(self._created_msg)
 
         async def _emit_transcript() -> None:
             # Only after the client's EOF, per the real-server contract ("done"
             # comes after all audio) — so the full paced send is measured, not
             # truncated when the transcript finishes early.
             await asyncio.sleep(self.first_delta_delay)
-            for i, w in enumerate(words):
+            for delta_msg in self._delta_msgs:  # pre-serialized
                 try:
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "transcription.delta",
-                                "delta": (" " + w if i else w),
-                            }
-                        )
-                    )
+                    await ws.send(delta_msg)
                 except Exception:
                     return
                 await asyncio.sleep(self.delta_dt)
             try:
-                await ws.send(
-                    json.dumps({"type": "transcription.done", "text": self.transcript})
-                )
+                await ws.send(self._done_msg)  # pre-serialized
                 await ws.close()
             except Exception:
                 pass
