@@ -21,6 +21,7 @@
 #include <poll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -38,6 +39,71 @@ static double now_ms() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+// Wall-clock (CLOCK_REALTIME) in ms — the domain the kernel stamps received
+// packets in (SO_TIMESTAMP/SO_TIMESTAMPNS). Used for the RECEIVE side so send and
+// receive timestamps share one clock; loop timing (deadlines/timeouts) stays on
+// the monotonic now_ms().
+static double now_realtime_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+// Ask the kernel to timestamp each received packet on arrival. Then recvmsg can
+// read that stamp instead of taking a userspace clock when the loop finally
+// reads the socket — eliminating the head-of-line lag where a chunk that arrived
+// while the loop serviced other sockets would be stamped late.
+static void enable_rx_timestamp(int fd) {
+  int on = 1;
+#if defined(SO_TIMESTAMPNS)
+  setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on));
+#endif
+#if defined(SO_TIMESTAMP)
+  setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on));
+#endif
+}
+
+// recvmsg that extracts the kernel receive timestamp (ms, CLOCK_REALTIME domain).
+// Falls back to a userspace realtime read when the kernel didn't attach one.
+static ssize_t recv_ts(int fd, char* buf, size_t len, double* ts_ms) {
+  struct iovec iov;
+  iov.iov_base = buf;
+  iov.iov_len = len;
+  char control[512];
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+  ssize_t n = recvmsg(fd, &msg, 0);
+  double ts = -1.0;
+  if (n > 0) {
+    for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm != nullptr;
+         cm = CMSG_NXTHDR(&msg, cm)) {
+      if (cm->cmsg_level != SOL_SOCKET) continue;
+#if defined(SCM_TIMESTAMPNS)
+      if (cm->cmsg_type == SCM_TIMESTAMPNS) {
+        struct timespec t;
+        memcpy(&t, CMSG_DATA(cm), sizeof(t));
+        ts = t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+        break;
+      }
+#endif
+#if defined(SCM_TIMESTAMP)
+      if (cm->cmsg_type == SCM_TIMESTAMP) {
+        struct timeval tv;
+        memcpy(&tv, CMSG_DATA(cm), sizeof(tv));
+        ts = tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+        break;
+      }
+#endif
+    }
+  }
+  *ts_ms = (ts >= 0.0) ? ts : now_realtime_ms();
+  return n;
 }
 
 struct Conn {
@@ -68,6 +134,7 @@ static int make_conn(const std::string& host, int port) {
   fcntl(fd, F_SETFL, flags | O_NONBLOCK);
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  enable_rx_timestamp(fd);  // kernel-stamp arrivals for drift-free receive times
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
@@ -251,9 +318,10 @@ static void parse_headers(EngineConn& c) {
   c.inbuf = rest;  // remaining bytes belong to the body
 }
 
-// Scan the body for SSE `data:` lines, timestamping each at read time.
-static void parse_body_sse(EngineConn& c) {
-  double ts = now_ms();
+// Scan the body for SSE `data:` lines, stamping each with `ts` — the kernel
+// receive time of the read that delivered these bytes (see recv_ts), so the
+// offset reflects true arrival, not when the loop got around to parsing.
+static void parse_body_sse(EngineConn& c, double ts) {
   size_t pos;
   while ((pos = c.inbuf.find('\n')) != std::string::npos) {
     std::string line = c.inbuf.substr(0, pos);
@@ -347,25 +415,26 @@ static void run_batch_worker(const std::string& host, int port,
           continue;
         }
         c.connected = true;
-        c.send_time = now_ms();
+        c.send_time = now_realtime_ms();  // realtime: matches kernel rx stamps
         const std::string& req = requests[c.index];
         ssize_t w = send(p.fd, req.data(), req.size(), 0);
         (void)w;
       } else if (c.connected && (p.revents & POLLIN)) {
         char buf[16384];
-        ssize_t r = recv(p.fd, buf, sizeof(buf), 0);
+        double kts;  // kernel receive timestamp for this read
+        ssize_t r = recv_ts(p.fd, buf, sizeof(buf), &kts);
         if (r > 0) {
           if (!c.headers_done) {
             c.header_buf.append(buf, r);
             parse_headers(c);
-            if (c.headers_done && c.sse) parse_body_sse(c);
+            if (c.headers_done && c.sse) parse_body_sse(c, kts);
             else if (c.headers_done) {
               c.content += c.inbuf;
               c.inbuf.clear();
             }
           } else if (c.sse) {
             c.inbuf.append(buf, r);
-            parse_body_sse(c);
+            parse_body_sse(c, kts);
           } else {
             c.content.append(buf, r);
           }
@@ -390,7 +459,7 @@ static void run_batch_worker(const std::string& host, int port,
       res.offsets_ms = std::move(c.offsets);
       res.sizes = std::move(c.sizes);
       if (!c.sse) {
-        res.offsets_ms.push_back(now_ms() - c.send_time);
+        res.offsets_ms.push_back(now_realtime_ms() - c.send_time);
         res.sizes.push_back((int)res.content.size());
       }
       close(fd);
@@ -582,12 +651,13 @@ static std::vector<ChainResult> run_chains(
           continue;
         }
         c.connected = true;
-        c.send_time = now_ms();
+        c.send_time = now_realtime_ms();
         const std::string& req = chains[c.chain][c.turn];
         send(pp.fd, req.data(), req.size(), 0);
       } else if (c.connected && (pp.revents & POLLIN)) {
         char buf[16384];
-        ssize_t r = recv(pp.fd, buf, sizeof(buf), 0);
+        double kts;
+        ssize_t r = recv_ts(pp.fd, buf, sizeof(buf), &kts);
         if (r > 0) {
           if (!c.headers_done) {
             c.header_buf.append(buf, r);
@@ -600,7 +670,7 @@ static std::vector<ChainResult> run_chains(
               EngineConn tmp;  // reuse the SSE line parser
               tmp.send_time = c.send_time;
               tmp.inbuf = c.inbuf;
-              parse_body_sse(tmp);
+              parse_body_sse(tmp, kts);
               c.inbuf = tmp.inbuf;
               c.content += tmp.content;
               for (double o : tmp.offsets) c.offsets.push_back(o);
@@ -611,7 +681,7 @@ static std::vector<ChainResult> run_chains(
             tmp.send_time = c.send_time;
             tmp.inbuf = c.inbuf;
             tmp.inbuf.append(buf, r);
-            parse_body_sse(tmp);
+            parse_body_sse(tmp, kts);
             c.inbuf = tmp.inbuf;
             c.content += tmp.content;
             for (double o : tmp.offsets) c.offsets.push_back(o);
