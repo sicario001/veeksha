@@ -277,3 +277,6 @@ microbench_output*
 
 # uv lock file
 uv.lock
+# local scratch: design docs, benches, summaries (not part of the deliverable)
+analysis/
+WhatsApp Image*
