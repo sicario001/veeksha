@@ -25,7 +25,7 @@ from veeksha.core.timed_event_stream import StreamEvent, TimedEventStream
 from veeksha.evaluator.base import EvaluationResult
 from veeksha.evaluator.performance.channel_base import BaseChannelPerformanceEvaluator
 from veeksha.evaluator.sharded_sketch import ShardedCDFSketch
-from veeksha.types import ChannelModality
+from veeksha.types import AudioTask, ChannelModality
 
 
 class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
@@ -51,6 +51,24 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
             "streaming_rtf": ShardedCDFSketch("Streaming Real Time Factor"),
             "session_size": ShardedCDFSketch("Requests per Session"),
         }
+        # STT (ASR) distributions: per-request WER + interactivity + first-text
+        # latency, alongside the corpus-level WER aggregates in _asr_accumulator.
+        self.asr_summaries: Dict[str, ShardedCDFSketch] = {
+            "final_wer": ShardedCDFSketch("Final WER", unit="%"),
+            "partial_wer": ShardedCDFSketch("Partial WER", unit="%"),
+            "interactivity": ShardedCDFSketch("Word Interactivity Latency", unit="ms"),
+            "time_to_first_visible_text": ShardedCDFSketch(
+                "Time to First Visible Text", unit="ms"
+            ),
+            "time_to_final_transcript": ShardedCDFSketch(
+                "Time to Final Transcript", unit="ms"
+            ),
+        }
+        # Lazily created on the first STT request so the TTS-only path never
+        # imports jiwer / the normalizer (heavier deps).
+        self._asr_accumulator: Optional[Any] = None
+        self._asr_rows: List[Dict[str, Any]] = []
+        self._num_asr_scored = 0
 
     # ---- lifecycle ----------------------------------------------------------
     def register_request(
@@ -78,6 +96,18 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
         if channel is None:
             return
         metrics = channel.metrics or {}
+
+        # STT (speech-to-text) responses carry transcripts + ground truth; score
+        # WER + interactivity. Everything else is a timing-only (TTS) response.
+        if metrics.get(ac.AUDIO_TASK) == AudioTask.STT and (
+            metrics.get("final_transcript") is not None
+            and metrics.get("expected_transcript") is not None
+        ):
+            self._score_stt_request(request_id, metrics)
+            with self._lock:
+                self._num_completed += 1
+            return
+
         derived = self._compute_metrics(channel, metrics)  # all in seconds
         if derived is None:
             return
@@ -96,6 +126,60 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
         with self._lock:
             self._num_completed += 1
 
+    # ---- STT scoring --------------------------------------------------------
+    def _score_stt_request(self, request_id: int, metrics: Dict[str, Any]) -> None:
+        """WER + interactivity for one realtime STT response (lock-free sketches).
+
+        jiwer / the normalizer are imported here so the TTS-only path never pays
+        for them. Corpus-level WER accumulates in the thread-safe accumulator;
+        per-request WER/interactivity/latency feed the sharded distributions.
+        """
+        from veeksha.evaluator.performance.asr import (
+            ASRMetricAccumulator,
+            score_asr_request,
+        )
+
+        if self._asr_accumulator is None:
+            with self._lock:
+                if self._asr_accumulator is None:
+                    self._asr_accumulator = ASRMetricAccumulator()
+
+        # STT duration = the streamed input clip (bytes / sample_rate), falling
+        # back to the client-reported input_audio_duration_ms.
+        sample_rate = int(metrics.get(ac.SAMPLE_RATE, ac.DEFAULT_AUDIO_SAMPLE_RATE))
+        byte_count = metrics.get(ac.PCM_BYTE_COUNT)
+        if byte_count:
+            duration_s = ac.pcm_bytes_to_duration_s(int(byte_count), sample_rate)
+        else:
+            duration_s = float(metrics.get("input_audio_duration_ms", 0.0)) / 1000.0
+
+        scored = score_asr_request(
+            request_id=request_id,
+            channel_metrics=metrics,
+            duration_s=duration_s,
+            accumulator=self._asr_accumulator,
+        )
+
+        # per-request distributions (lock-free sharded puts)
+        if scored.final_wer is not None:
+            self.asr_summaries["final_wer"].put(scored.final_wer)
+        if scored.partial_wer is not None:
+            self.asr_summaries["partial_wer"].put(scored.partial_wer)
+        if scored.interactivity is not None:
+            self.asr_summaries["interactivity"].put(scored.interactivity)
+        if scored.time_to_first_visible_text is not None:
+            self.asr_summaries["time_to_first_visible_text"].put(
+                scored.time_to_first_visible_text
+            )
+        if scored.time_to_final_transcript is not None:
+            self.asr_summaries["time_to_final_transcript"].put(
+                scored.time_to_final_transcript
+            )
+
+        with self._lock:
+            self._asr_rows.append(scored.to_request_row())
+            self._num_asr_scored += 1
+
     def record_session_completed(
         self,
         session_id: int,
@@ -110,6 +194,13 @@ class AudioPerformanceEvaluator(BaseChannelPerformanceEvaluator):
         for sketch in self.summaries.values():
             if len(sketch) > 0:
                 summary.update(sketch.get_summary())
+        # STT: per-request WER/interactivity distributions + corpus WER aggregates.
+        for sketch in self.asr_summaries.values():
+            if len(sketch) > 0:
+                summary.update(sketch.get_summary())
+        if self._asr_accumulator is not None:
+            summary["num_asr_scored_requests"] = self._num_asr_scored
+            summary.update(self._asr_accumulator.get_summary())
         return EvaluationResult(
             evaluator_type="audio_performance",
             channel=ChannelModality.AUDIO,
