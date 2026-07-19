@@ -143,3 +143,131 @@ class DummyRealtimeAudioServer:
                 pass
         for t in self._threads:
             t.join(timeout=2.0)
+
+
+class DummySTTPreflightServer:
+    """STT WebSocket server that RECORDS where the client's audio actually lands.
+
+    For ASR the interactivity-critical drift is on the *send* side: veeksha must
+    stream the input audio at 1x real time. This server measures that at the
+    ground-truth point — it timestamps each ``input_audio_buffer.append`` on
+    arrival (per connection, relative to that connection's first append) — while
+    emitting transcript deltas on a fixed schedule so receive timing is
+    deterministic too. Speaks the minimal vllm_realtime contract STTClient expects.
+    """
+
+    def __init__(
+        self,
+        transcript: str = "the quick brown fox jumps over the lazy dog",
+        first_delta_delay: float = 0.05,
+        delta_dt: float = 0.03,
+        host: str = "127.0.0.1",
+    ):
+        self.transcript = transcript
+        self.first_delta_delay = first_delta_delay
+        self.delta_dt = delta_dt
+        self.host = host
+        self.port: int = 0
+        # per-connection append-arrival offsets (ms from that conn's first append)
+        self.append_arrivals: List[List[float]] = []
+        self._stoppers: List[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = []
+        self._threads: List[threading.Thread] = []
+
+    async def _handler(self, ws) -> None:
+        import time
+
+        await ws.send(json.dumps({"type": "session.created"}))
+        words = self.transcript.split()
+
+        async def _emit_transcript() -> None:
+            # Only after the client's EOF, per the real-server contract ("done"
+            # comes after all audio) — so the full paced send is measured, not
+            # truncated when the transcript finishes early.
+            await asyncio.sleep(self.first_delta_delay)
+            for i, w in enumerate(words):
+                try:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "transcription.delta",
+                                "delta": (" " + w if i else w),
+                            }
+                        )
+                    )
+                except Exception:
+                    return
+                await asyncio.sleep(self.delta_dt)
+            try:
+                await ws.send(
+                    json.dumps({"type": "transcription.done", "text": self.transcript})
+                )
+                await ws.close()
+            except Exception:
+                pass
+
+        arrivals: List[float] = []
+        first_append: Optional[float] = None
+        transcript_task: Optional[asyncio.Future] = None
+        try:
+            async for raw in ws:  # drain client audio; timestamp each append
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError, TypeError, ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                etype = event.get("type")
+                if etype == "input_audio_buffer.append":
+                    now = time.monotonic()
+                    if first_append is None:
+                        first_append = now
+                    arrivals.append((now - first_append) * 1000.0)
+                elif etype == "input_audio_buffer.commit" and event.get("final"):
+                    # client EOF: full audio received -> now emit the transcript
+                    if transcript_task is None:
+                        transcript_task = asyncio.ensure_future(_emit_transcript())
+        except Exception:
+            pass
+        finally:
+            if transcript_task is not None:
+                transcript_task.cancel()
+            if arrivals:
+                self.append_arrivals.append(arrivals)
+
+    def start(self) -> "DummySTTPreflightServer":
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind((self.host, 0))
+        self.port = s.getsockname()[1]
+        s.close()
+        ready = threading.Event()
+
+        def _run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            stop_ev = asyncio.Event()
+            self._stoppers.append((loop, stop_ev))
+
+            async def _main():
+                async with websockets.serve(self._handler, self.host, self.port):
+                    ready.set()
+                    await stop_ev.wait()
+
+            try:
+                loop.run_until_complete(_main())
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=_run, daemon=True, name="preflight-stt")
+        t.start()
+        self._threads.append(t)
+        ready.wait(timeout=5.0)
+        return self
+
+    def stop(self) -> None:
+        for loop, ev in self._stoppers:
+            try:
+                loop.call_soon_threadsafe(ev.set)
+            except Exception:
+                pass
+        for t in self._threads:
+            t.join(timeout=2.0)

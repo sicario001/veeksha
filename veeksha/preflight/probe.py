@@ -365,3 +365,99 @@ def _single_text_request(rid: int) -> Request:
             )
         },
     )
+
+
+def probe_stt_transport(
+    concurrency: int,
+    clip_s: float = 2.0,
+    sample_rate: int = 16000,
+    request_timeout: float = 30.0,
+) -> Dict[str, float]:
+    """Per-audio-chunk SEND drift on the REAL STT client's realtime pacing.
+
+    For ASR the interactivity-critical drift is on the SEND side: veeksha must
+    stream the input audio at 1x real time (a 90s clip should take 90s to send).
+    We measure this at the ground-truth point — a dummy server timestamps each
+    ``input_audio_buffer.append`` on arrival — while driving the actual STTClient
+    at ``concurrency``. So this exercises the real WS send path (encode + paced
+    ws.send), not a synthetic model.
+
+    Returns p99/max of ``|arrival offset - i * chunk_period|`` (ms) and the
+    aggregate stretch (send span / ideal span; 1.0 == perfect real-time pacing).
+    """
+    import os
+    import tempfile
+    import wave
+
+    from veeksha.client.stt import STTClient
+    from veeksha.config.client import STTClientConfig
+    from veeksha.core.request_content import AudioChannelRequestContent
+    from veeksha.preflight.audio_server import DummySTTPreflightServer
+
+    server = DummySTTPreflightServer().start()
+    tmpdir = tempfile.mkdtemp()
+    wav_path = os.path.join(tmpdir, "clip.wav")
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(b"\x00\x00" * int(sample_rate * clip_s))
+
+    try:
+        config = STTClientConfig(
+            api_base=f"http://127.0.0.1:{server.port}",
+            model="preflight-stt",
+            provider="vllm_realtime",
+            sample_rate=sample_rate,
+            ws_realtime_pacing=True,
+            request_timeout=request_timeout,
+        )
+        client = STTClient(config)
+        chunk_bytes = config.ws_chunk_size
+
+        def _req(i: int) -> Request:
+            return Request(
+                id=i,
+                channels={
+                    ChannelModality.AUDIO: AudioChannelRequestContent(
+                        input_audio=wav_path
+                    )
+                },
+                metadata={"expected_transcript": "x", "dataset": "preflight"},
+            )
+
+        async def _run():
+            tasks = [
+                asyncio.create_task(client.send_request(_req(i), session_id=i))
+                for i in range(concurrency)
+            ]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        asyncio.run(_run())
+    finally:
+        server.stop()
+        try:
+            os.remove(wav_path)
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+    # chunk i should arrive at server at ~ i * chunk_period (1x real-time pacing)
+    chunk_period_ms = chunk_bytes / 2.0 / sample_rate * 1000.0
+    send_drift_ms: List[float] = []
+    stretches: List[float] = []
+    for arrivals in server.append_arrivals:
+        if len(arrivals) < 2:
+            continue
+        for i, arrival in enumerate(arrivals):
+            send_drift_ms.append(abs(arrival - i * chunk_period_ms))
+        span = arrivals[-1] - arrivals[0]
+        ideal = (len(arrivals) - 1) * chunk_period_ms
+        if ideal > 0:
+            stretches.append(span / ideal)
+    return {
+        "achieved": float(len(server.append_arrivals)),
+        "send_drift_p99_ms": _pct(send_drift_ms, 99),
+        "send_drift_max_ms": max(send_drift_ms) if send_drift_ms else float("nan"),
+        "stretch_p99": _pct(stretches, 99),
+    }

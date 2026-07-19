@@ -132,3 +132,14 @@ def test_run_preflight_check_includes_audio_transport_when_enabled():
     assert any("audio-transport" in n for n in names)
     audio = next(c for c in report.checks if "audio-transport" in c.name)
     assert audio.points  # measured at least one concurrency rung
+
+
+# ------------------------------------------------------------------ STT send pacing
+def test_probe_stt_transport_paces_audio_at_realtime():
+    """The real STT client streams input audio at ~1x with small per-chunk drift."""
+    from veeksha.preflight.probe import probe_stt_transport
+
+    r = probe_stt_transport(concurrency=4, clip_s=1.0, sample_rate=16000)
+    assert r["achieved"] == 4.0
+    assert r["stretch_p99"] < 1.10  # ~real-time (a 1s clip takes ~1s to send)
+    assert r["send_drift_p99_ms"] < 25.0  # per-chunk send precision on localhost

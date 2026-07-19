@@ -214,12 +214,43 @@ def run_preflight_check(config: "PreflightCheckConfig") -> PreflightReport:
                 )
 
             audio = _run_check(
-                "audio-transport receive drift (realtime WS)",
+                "audio-transport receive drift (realtime TTS, WS)",
                 target,
                 ladder,
                 measure_audio,
             )
             report.checks.append(audio)
+
+            # ASR/STT: the critical drift is on the SEND side (pacing audio in at
+            # 1x). Measured at the server (append-arrival time) driving the real
+            # STTClient — distinct from the receive-side checks above.
+            from veeksha.preflight.probe import probe_stt_transport
+
+            def measure_stt(c: int) -> ConcurrencyPoint:
+                r = probe_stt_transport(c, clip_s=config.pacing_clip_s)
+                honest = (
+                    r["achieved"] >= 0.95 * c
+                    and r["send_drift_p99_ms"] < config.drift_threshold_ms
+                    and r["stretch_p99"] < config.stretch_threshold
+                )
+                return ConcurrencyPoint(
+                    concurrency=c,
+                    achieved=int(r["achieved"]),
+                    ivl_err_p99_ms=r["send_drift_p99_ms"],  # per-chunk SEND drift
+                    stretch_p99=r["stretch_p99"],
+                    ttfc_p99_ms=float("nan"),
+                    throughput=float("nan"),
+                    server_jitter_p99_ms=0.0,
+                    honest=honest,
+                )
+
+            stt = _run_check(
+                "audio-transport send pacing (realtime STT/ASR, WS)",
+                target,
+                ladder,
+                measure_stt,
+            )
+            report.checks.append(stt)
 
         # ---- optional native (C++) receive-path comparison ----
         if config.compare_native:
