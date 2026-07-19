@@ -29,6 +29,26 @@ def native_available() -> bool:
     return _ext is not None
 
 
+def native_can_handle(url_or_scheme: str) -> bool:
+    """Whether the native transport can serve this endpoint.
+
+    The native engine owns the plaintext hot path (``http://`` / ``ws://``) — the
+    common case for inference servers inside a trusted network (vLLM, datacenter
+    gateways), where microsecond receive/pacing precision matters most. TLS
+    endpoints (``https://`` / ``wss://``) route to the Python transport, whose
+    per-request overhead is negligible relative to the remote-network latency a
+    TLS endpoint implies. Callers use this to decide native-vs-Python per endpoint.
+    """
+    if not native_available():
+        return False
+    scheme = (
+        url_or_scheme.split("://", 1)[0].lower()
+        if "://" in url_or_scheme
+        else (url_or_scheme.lower())
+    )
+    return scheme in ("http", "ws", "")
+
+
 @dataclass
 class NativeRequest:
     """One request the native engine will send (Python owns the *what*)."""

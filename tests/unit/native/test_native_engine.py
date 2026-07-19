@@ -98,3 +98,14 @@ def test_native_batch_receive_drift_is_honest():
         engine.stop()
     assert m["completed"] >= 190  # native owns concurrency; ~all complete
     assert m["ivl_err_p99_ms"] < 20.0  # honest to the 20ms cadence
+
+
+def test_native_transport_scheme_routing():
+    """Native owns plaintext; TLS endpoints route to the Python transport."""
+    from veeksha.native.engine import native_can_handle
+
+    assert native_can_handle("http://127.0.0.1:8000/v1")
+    assert native_can_handle("ws://host/realtime")
+    # TLS -> Python fallback (native returns False so callers pick the Python path)
+    assert not native_can_handle("https://api.example.com/v1")
+    assert not native_can_handle("wss://api.example.com/realtime")
