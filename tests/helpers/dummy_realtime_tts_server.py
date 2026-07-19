@@ -62,6 +62,7 @@ class DummyRealtimeTTSServer:
                     {"type": "response.done", "response": {"status": "completed"}}
                 )
             )
+            await ws.close()  # terminal: let clients stop promptly
         except Exception:
             pass
 

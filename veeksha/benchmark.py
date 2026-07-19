@@ -66,6 +66,52 @@ def _maybe_pregenerate_sessions(benchmark_config, session_generator) -> Optional
     return pregenerated_sessions
 
 
+def _maybe_run_native(
+    benchmark_config, evaluator, session_generator, pregenerated_sessions
+):
+    """Run the batch over the native (C++) transport when the client opts in.
+
+    Returns the finalized EvaluationResult, or None to fall back to the Python
+    worker pipeline. Native owns connection concurrency + kernel-time timing, so
+    this path removes the Python per-event overhead. It needs a bounded run
+    (max_sessions > 0) and handles independent (single-request) sessions; the
+    Python pipeline still serves rate-based / multi-turn-dependent traffic.
+    """
+    from veeksha.native.runner import feed_native_results, should_use_native
+
+    client_config = benchmark_config.client
+    if not should_use_native(client_config):
+        return None
+    max_sessions = benchmark_config.runtime.max_sessions
+    if max_sessions <= 0:
+        logger.warning(
+            "use_native_transport is set but max_sessions <= 0; the native path "
+            "needs a bounded run. Falling back to the Python pipeline."
+        )
+        return None
+
+    sessions = pregenerated_sessions
+    if sessions is None:
+        sessions = []
+        for _ in range(max_sessions):
+            try:
+                sessions.append(session_generator.generate_session())
+            except StopIteration:
+                break
+    requests = [req for s in sessions for req in s.requests.values()]
+    concurrency = getattr(
+        benchmark_config.traffic_scheduler, "target_concurrent_sessions", 0
+    ) or min(len(requests), 64)
+    logger.info(
+        "Native transport: %d requests at concurrency %d (%s)",
+        len(requests),
+        concurrency,
+        client_config.get_type(),
+    )
+    feed_native_results(requests, evaluator, client_config, concurrency)
+    return evaluator.finalize()
+
+
 def _run_main_loop(
     session_generator,
     traffic_scheduler,
@@ -280,6 +326,18 @@ def _run_benchmark(
         session_generator=session_generator,
         benchmark_start_time=benchmark_start_time,
     )
+
+    # Native transport fast path: when the client opts in (and the endpoint is
+    # plaintext + the run is bounded), run the batch over the C++ engine instead
+    # of the Python worker pipeline, then finalize/save the same way.
+    native_result = _maybe_run_native(
+        benchmark_config, evaluator, session_generator, pregenerated_sessions
+    )
+    if native_result is not None:
+        os.makedirs(f"{benchmark_config.output_dir}/metrics", exist_ok=True)
+        evaluator.save(f"{benchmark_config.output_dir}/metrics")
+        logger.info("Native transport run complete.")
+        return native_result
 
     # trace recorder
     trace_recorder = None

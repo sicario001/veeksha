@@ -626,6 +626,7 @@ struct WsResult {
   std::vector<double> offsets_ms;  // per data-frame arrival offset (ms from send)
   std::vector<int> sizes;          // per data-frame payload size (bytes)
   std::string content;             // concatenated text/binary payloads
+  std::vector<std::string> frames;  // per data-frame payload (for protocol parse)
   std::vector<double> sent_offsets_ms;  // actual send offset of each paced message
   std::string error;
 };
@@ -642,6 +643,7 @@ struct WsConn {
   std::vector<double> offsets;
   std::vector<int> sizes;
   std::string content;
+  std::vector<std::string> frames;
   std::vector<double> sent_offsets;
 };
 
@@ -708,6 +710,7 @@ static void ws_parse_frames(WsConn& c) {
       c.offsets.push_back(ts - c.send_time);
       c.sizes.push_back((int)payload.size());
       c.content += payload;
+      c.frames.push_back(payload);
     }
     // ping/pong/continuation: ignored for timing purposes.
   }
@@ -857,6 +860,7 @@ static std::vector<WsResult> ws_stream(const std::string& host, int port,
       res.offsets_ms = std::move(c.offsets);
       res.sizes = std::move(c.sizes);
       res.content = std::move(c.content);
+      res.frames = std::move(c.frames);
       res.sent_offsets_ms = std::move(c.sent_offsets);
       close(fd);
       conns.erase(it);
@@ -870,6 +874,7 @@ static std::vector<WsResult> ws_stream(const std::string& host, int port,
       res.offsets_ms = std::move(kv.second.offsets);
       res.sizes = std::move(kv.second.sizes);
       res.content = std::move(kv.second.content);
+      res.frames = std::move(kv.second.frames);
     }
     if (res.sent_offsets_ms.empty() && !kv.second.sent_offsets.empty())
       res.sent_offsets_ms = std::move(kv.second.sent_offsets);
@@ -877,6 +882,153 @@ static std::vector<WsResult> ws_stream(const std::string& host, int port,
     close(kv.first);
   }
   return results;
+}
+
+// Per-connection WS batch with a concurrency cap + refill (mirrors run_batch):
+// each request has its own message sequence + send schedule, so N distinct audio
+// requests (different text / audio) run concurrently over one poll() loop.
+static std::vector<WsResult> ws_run_batch(
+    const std::string& host, int port, const std::string& path,
+    const std::vector<std::vector<std::string>>& req_messages,
+    const std::vector<std::vector<double>>& req_offsets, int concurrency,
+    double timeout_s) {
+  struct rlimit rl;
+  getrlimit(RLIMIT_NOFILE, &rl);
+  rl.rlim_cur = std::max<rlim_t>(rl.rlim_cur, (rlim_t)(concurrency + 64));
+  if (rl.rlim_cur > rl.rlim_max) rl.rlim_cur = rl.rlim_max;
+  setrlimit(RLIMIT_NOFILE, &rl);
+
+  int total = (int)req_messages.size();
+  std::vector<WsResult> results(total);
+  for (int i = 0; i < total; i++) results[i].index = i;
+  std::string handshake = ws_handshake(host, port, path);
+
+  std::unordered_map<int, WsConn> conns;
+  int launched = 0, completed = 0;
+
+  auto try_launch = [&]() {
+    while ((int)conns.size() < concurrency && launched < total) {
+      int fd = make_conn(host, port);
+      if (fd < 0) {
+        results[launched].error = "connect failed";
+        completed++;
+        launched++;
+        continue;
+      }
+      WsConn c;
+      c.index = launched;
+      conns.emplace(fd, std::move(c));
+      launched++;
+    }
+  };
+  try_launch();
+
+  double t0 = now_ms();
+  while (completed < total && (now_ms() - t0) < timeout_s * 1000.0) {
+    std::vector<struct pollfd> pfds;
+    pfds.reserve(conns.size());
+    double next_wake = 50.0;
+    for (auto& kv : conns) {
+      if (kv.second.done) continue;
+      struct pollfd pp;
+      pp.fd = kv.first;
+      pp.events = kv.second.connected ? POLLIN : POLLOUT;
+      pp.revents = 0;
+      pfds.push_back(pp);
+      if (kv.second.handshaken) {
+        double wait = ws_pump_sends(kv.first, kv.second, req_messages[kv.second.index],
+                                    req_offsets[kv.second.index]);
+        if (wait < next_wake) next_wake = wait;
+      }
+    }
+    if (pfds.empty()) break;
+    int timeout_ms = (int)std::max(0.0, std::min(50.0, next_wake));
+    int n = poll(pfds.data(), pfds.size(), timeout_ms);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    std::vector<int> to_close;
+    for (auto& pp : pfds) {
+      auto it = conns.find(pp.fd);
+      if (it == conns.end()) continue;
+      WsConn& c = it->second;
+      if (!c.connected && (pp.revents & (POLLOUT | POLLERR | POLLHUP))) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        getsockopt(pp.fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err != 0) {
+          results[c.index].error = "connect error";
+          to_close.push_back(pp.fd);
+          continue;
+        }
+        c.connected = true;
+        send(pp.fd, handshake.data(), handshake.size(), 0);
+      } else if (c.connected && (pp.revents & POLLIN)) {
+        char buf[16384];
+        ssize_t r = recv(pp.fd, buf, sizeof(buf), 0);
+        if (r > 0) {
+          c.inbuf.append(buf, r);
+          if (!c.handshaken) {
+            size_t term = c.inbuf.find("\r\n\r\n");
+            if (term != std::string::npos) {
+              c.inbuf.erase(0, term + 4);
+              c.handshaken = true;
+              c.send_time = now_ms();
+            }
+          }
+          if (c.handshaken)
+            ws_pump_sends(pp.fd, c, req_messages[c.index], req_offsets[c.index]);
+          if (c.handshaken) ws_parse_frames(c);
+          if (c.done) to_close.push_back(pp.fd);
+        } else if (r == 0) {
+          to_close.push_back(pp.fd);
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+          results[c.index].error = "recv error";
+          to_close.push_back(pp.fd);
+        }
+      } else if (pp.revents & (POLLERR | POLLHUP)) {
+        to_close.push_back(pp.fd);
+      }
+    }
+    for (int fd : to_close) {
+      auto it = conns.find(fd);
+      if (it == conns.end()) continue;
+      WsConn& c = it->second;
+      WsResult& res = results[c.index];
+      res.offsets_ms = std::move(c.offsets);
+      res.sizes = std::move(c.sizes);
+      res.content = std::move(c.content);
+      res.frames = std::move(c.frames);
+      res.sent_offsets_ms = std::move(c.sent_offsets);
+      close(fd);
+      conns.erase(it);
+      completed++;
+    }
+    try_launch();
+  }
+  for (auto& kv : conns) {
+    WsResult& res = results[kv.second.index];
+    if (res.offsets_ms.empty() && !kv.second.offsets.empty()) {
+      res.offsets_ms = std::move(kv.second.offsets);
+      res.sizes = std::move(kv.second.sizes);
+      res.content = std::move(kv.second.content);
+      res.frames = std::move(kv.second.frames);
+    }
+    if (res.error.empty() && res.offsets_ms.empty()) res.error = "timeout";
+    close(kv.first);
+  }
+  return results;
+}
+
+static std::vector<WsResult> py_ws_run_batch(
+    const std::string& host, int port, const std::string& path,
+    const std::vector<std::vector<std::string>>& req_messages,
+    const std::vector<std::vector<double>>& req_offsets, int concurrency,
+    double timeout_s) {
+  py::gil_scoped_release release;
+  return ws_run_batch(host, port, path, req_messages, req_offsets, concurrency,
+                      timeout_s);
 }
 
 static std::vector<WsResult> py_ws_stream(
@@ -933,6 +1085,7 @@ PYBIND11_MODULE(veeksha_native, m, py::mod_gil_not_used()) {
       .def_readonly("offsets_ms", &WsResult::offsets_ms)
       .def_readonly("sizes", &WsResult::sizes)
       .def_readonly("content", &WsResult::content)
+      .def_readonly("frames", &WsResult::frames)
       .def_readonly("sent_offsets_ms", &WsResult::sent_offsets_ms)
       .def_readonly("error", &WsResult::error);
 
@@ -945,4 +1098,12 @@ PYBIND11_MODULE(veeksha_native, m, py::mod_gil_not_used()) {
         "ms from handshake), read server frames timestamped at socket-read time. "
         "Returns one WsResult per connection (per-frame offsets_ms + sizes + "
         "content, and sent_offsets_ms = the actual paced send times).");
+
+  m.def("ws_run_batch", &py_ws_run_batch, py::arg("host"), py::arg("port"),
+        py::arg("path"), py::arg("req_messages"), py::arg("req_offsets"),
+        py::arg("concurrency"), py::arg("timeout_s") = 120.0,
+        "Per-connection WS batch with concurrency cap + refill: each request has "
+        "its own message sequence + paced send schedule, so N distinct realtime "
+        "requests run concurrently over one poll() loop. Returns a WsResult per "
+        "request (index-aligned to req_messages).");
 }

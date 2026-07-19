@@ -57,6 +57,7 @@ class DummySTTServer:
                 await ws.send(
                     json.dumps({"type": "transcription.done", "text": self.transcript})
                 )
+                await ws.close()  # terminal: let clients stop promptly
             except Exception:
                 pass
 

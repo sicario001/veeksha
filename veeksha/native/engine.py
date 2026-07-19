@@ -203,12 +203,18 @@ class NativeWsResult:
     index: int
     stream: TimedEventStream  # server frames, offsets in seconds from handshake
     content: str
+    frames: List[str] = field(default_factory=list)  # per-frame payloads
     sent_offsets_s: List[float] = field(default_factory=list)
     error: str = ""
 
     @property
     def success(self) -> bool:
         return not self.error and len(self.stream) > 0
+
+    def timed_frames(self):
+        """Yield (offset_s, payload) per received data frame, in arrival order."""
+        for event, payload in zip(self.stream.events, self.frames):
+            yield event.offset_s, payload
 
 
 class NativeWsEngine:
@@ -261,6 +267,54 @@ class NativeWsEngine:
                     index=item.index,
                     stream=TimedEventStream(modality, events),
                     content=item.content,
+                    frames=list(item.frames),
+                    sent_offsets_s=[o / 1000.0 for o in item.sent_offsets_ms],
+                    error=item.error,
+                )
+            )
+        return results
+
+    def stream_batch(
+        self,
+        path: str,
+        req_messages: List[List[str]],
+        concurrency: int,
+        req_offsets_s: Optional[List[List[float]]] = None,
+        timeout_s: float = 30.0,
+        modality: ChannelModality = ChannelModality.AUDIO,
+    ) -> List[NativeWsResult]:
+        """Run N distinct WS requests concurrently (per-connection messages).
+
+        Each request in ``req_messages`` gets its own message sequence + paced
+        send schedule; native caps simultaneous connections at ``concurrency``
+        and refills as they complete — so audio requests scale like the SSE path
+        instead of running one at a time.
+        """
+        if req_offsets_s is None:
+            offsets_ms = [[] for _ in req_messages]
+        else:
+            offsets_ms = [[s * 1000.0 for s in off] for off in req_offsets_s]
+        raw = _ext.ws_run_batch(
+            self.host,
+            self.port,
+            path,
+            req_messages,
+            offsets_ms,
+            concurrency,
+            timeout_s,
+        )
+        results: List[NativeWsResult] = []
+        for item in raw:
+            events = [
+                StreamEvent(offset_s=off / 1000.0, size=size, kind="output")
+                for off, size in zip(item.offsets_ms, item.sizes)
+            ]
+            results.append(
+                NativeWsResult(
+                    index=item.index,
+                    stream=TimedEventStream(modality, events),
+                    content=item.content,
+                    frames=list(item.frames),
                     sent_offsets_s=[o / 1000.0 for o in item.sent_offsets_ms],
                     error=item.error,
                 )
