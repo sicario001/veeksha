@@ -56,9 +56,9 @@ def test_run_native_benchmark_text_produces_evaluation_result():
     from veeksha.config.evaluator import PerformanceEvaluatorConfig
     from veeksha.evaluator.performance.base import PerformanceEvaluator
     from veeksha.native.runner import run_native_benchmark
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
-    engine = DummyStreamingEngine(
+    engine = MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.03, default_chunks=10, num_loops=4
     ).start()
     try:
@@ -86,7 +86,7 @@ def test_run_native_benchmark_text_produces_evaluation_result():
 
 
 def test_run_native_benchmark_stt_scores_wer(tmp_path: Path):
-    from tests.helpers.dummy_stt_server import DummySTTServer
+    from tests.helpers.mock_stt_server import MockSTTServer
     from veeksha.config.client import STTClientConfig
     from veeksha.config.evaluator import PerformanceEvaluatorConfig
     from veeksha.core.request import Request
@@ -102,7 +102,7 @@ def test_run_native_benchmark_stt_scores_wer(tmp_path: Path):
         w.setframerate(16000)
         w.writeframes(b"\x00\x00" * 16000)
 
-    srv = DummySTTServer(transcript="the quick brown fox").start()
+    srv = MockSTTServer(transcript="the quick brown fox").start()
     try:
         client_config = STTClientConfig(
             api_base=f"http://127.0.0.1:{srv.port}",

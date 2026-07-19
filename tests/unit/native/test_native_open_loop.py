@@ -16,10 +16,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _dummy_engine():
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+def _mock_engine():
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
-    return DummyStreamingEngine(
+    return MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.02, default_chunks=5, num_loops=8
     ).start()
 
@@ -40,7 +40,7 @@ def _text_request(rid):
 def test_native_open_loop_dispatch_follows_arrival_schedule():
     from veeksha.native.engine import NativeReceiveEngine, NativeRequest
 
-    engine = _dummy_engine()
+    engine = _mock_engine()
     try:
         native = NativeReceiveEngine("127.0.0.1", engine.port)
         n = 16
@@ -102,7 +102,7 @@ def test_maybe_run_native_open_loop_and_multiturn_fallback():
     from veeksha.core.seeding import SeedManager
     from veeksha.evaluator.performance.base import PerformanceEvaluator
 
-    engine = _dummy_engine()
+    engine = _mock_engine()
     try:
         cfg = BenchmarkConfig(
             client=OpenAIChatCompletionsClientConfig(

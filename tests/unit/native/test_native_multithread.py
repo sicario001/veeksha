@@ -20,10 +20,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _dummy_engine(num_chunks=8):
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+def _mock_engine(num_chunks=8):
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
-    return DummyStreamingEngine(
+    return MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.02, default_chunks=num_chunks, num_loops=16
     ).start()
 
@@ -35,7 +35,7 @@ def _chat(num_chunks):
 
 @pytest.mark.parametrize("num_threads", [1, 2, 4, 8])
 def test_sharded_threads_preserve_correctness(num_threads):
-    engine_srv = _dummy_engine(num_chunks=8)
+    engine_srv = _mock_engine(num_chunks=8)
     try:
         native = NativeReceiveEngine("127.0.0.1", engine_srv.port)
         n = 120

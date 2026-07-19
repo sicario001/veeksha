@@ -1,4 +1,4 @@
-"""A dummy OpenAI-Realtime TTS WebSocket server for tests.
+"""A mock OpenAI-Realtime TTS WebSocket server for tests.
 
 Speaks the minimal realtime contract the RealtimeTTSClient expects: on
 ``session.update`` it replies ``session.updated`` (echoing the output sample
@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 import websockets
 
 
-class DummyRealtimeTTSServer:
+class MockRealtimeTTSServer:
     def __init__(
         self,
         num_chunks: int = 5,
@@ -102,7 +102,7 @@ class DummyRealtimeTTSServer:
             if audio_task is not None:
                 audio_task.cancel()
 
-    def start(self) -> "DummyRealtimeTTSServer":
+    def start(self) -> "MockRealtimeTTSServer":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
@@ -125,7 +125,7 @@ class DummyRealtimeTTSServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="dummy-realtime-tts")
+        t = threading.Thread(target=_run, daemon=True, name="mock-realtime-tts")
         t.start()
         self._threads.append(t)
         ready.wait(timeout=5.0)

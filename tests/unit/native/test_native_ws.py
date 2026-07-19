@@ -1,6 +1,6 @@
 """P3: native WebSocket receive + timer-wheel send pacing.
 
-Drives the native WS engine against the Python dummy realtime server (real
+Drives the native WS engine against the Python mock realtime server (real
 websockets handshake + framing), validating per-frame receive timing and
 per-message paced-send precision.
 """
@@ -19,9 +19,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def _server(num_chunks=8, delta_dt=0.02):
-    from tests.helpers.dummy_realtime_tts_server import DummyRealtimeTTSServer
+    from tests.helpers.mock_realtime_tts_server import MockRealtimeTTSServer
 
-    return DummyRealtimeTTSServer(
+    return MockRealtimeTTSServer(
         num_chunks=num_chunks,
         chunk_bytes=2400,
         first_delta_delay=0.02,

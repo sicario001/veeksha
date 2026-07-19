@@ -14,10 +14,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _dummy_engine(num_chunks=8):
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+def _mock_engine(num_chunks=8):
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
-    return DummyStreamingEngine(
+    return MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.03, default_chunks=num_chunks, num_loops=2
     ).start()
 
@@ -28,7 +28,7 @@ def _chat_request(num_chunks: int) -> NativeRequest:
 
 
 def test_native_engine_returns_content_and_timeline():
-    engine = _dummy_engine(num_chunks=8)
+    engine = _mock_engine(num_chunks=8)
     try:
         native = NativeReceiveEngine("127.0.0.1", engine.port)
         results = native.run([_chat_request(8) for _ in range(10)], concurrency=5)
@@ -51,7 +51,7 @@ def test_native_engine_returns_content_and_timeline():
 
 def test_native_engine_timeline_matches_known_cadence():
     """The native per-chunk timeline reproduces the engine's 20ms cadence."""
-    engine = _dummy_engine(num_chunks=12)
+    engine = _mock_engine(num_chunks=12)
     try:
         native = NativeReceiveEngine("127.0.0.1", engine.port)
         results = native.run([_chat_request(12) for _ in range(8)], concurrency=4)
@@ -84,7 +84,7 @@ def test_native_batch_receive_drift_is_honest():
     """P5: the real native engine records the cadence with low per-chunk drift."""
     from veeksha import native
 
-    engine = _dummy_engine(num_chunks=20)
+    engine = _mock_engine(num_chunks=20)
     try:
         m = native.batch_receive_drift(
             "127.0.0.1",

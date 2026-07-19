@@ -23,7 +23,7 @@ def test_openai_router_client_routes_per_request_api_mode() -> None:
     config = OpenAIRouterClientConfig(
         api_base="http://example.com/v1",
         api_key="",
-        model="dummy",
+        model="mock",
     )
     client = ClientRegistry.get(
         config.get_type(),
@@ -121,7 +121,7 @@ def test_openai_router_client_uses_separate_max_tokens_params() -> None:
     config = OpenAIRouterClientConfig(
         api_base="http://example.com/v1",
         api_key="",
-        model="dummy",
+        model="mock",
         max_tokens_param="max_completion_tokens",  # for chat
         completions_max_tokens_param="max_tokens",  # for completions
     )

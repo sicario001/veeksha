@@ -22,7 +22,9 @@ class TestPrefillConfig:
         assert cfg.samples_per_length == 10
 
     def test_custom_values(self):
-        cfg = PrefillMicrobenchmarkConfig(input_lengths=[64, 128], samples_per_length=5, output_tokens=2)
+        cfg = PrefillMicrobenchmarkConfig(
+            input_lengths=[64, 128], samples_per_length=5, output_tokens=2
+        )
         assert cfg.input_lengths == [64, 128]
         assert cfg.samples_per_length == 5
         assert cfg.output_tokens == 2
@@ -70,7 +72,9 @@ class TestDecodeConfig:
             DecodeMicrobenchmarkConfig(engine_chunk_size=0)
 
     def test_batch_size_ge_chunk_size(self):
-        with pytest.raises(ValueError, match="batch_size 512 must be less than engine_chunk_size 512"):
+        with pytest.raises(
+            ValueError, match="batch_size 512 must be less than engine_chunk_size 512"
+        ):
             DecodeMicrobenchmarkConfig(batch_sizes=[512], engine_chunk_size=512)
 
 
@@ -98,7 +102,9 @@ class TestStressConfig:
 
     def test_range_mode(self):
         cfg = StressMicrobenchmarkConfig(
-            mode=RangeStressModeConfig(concurrency_min=2, concurrency_max=32, concurrency_points=4),
+            mode=RangeStressModeConfig(
+                concurrency_min=2, concurrency_max=32, concurrency_points=4
+            ),
         )
         assert cfg.mode.concurrency_min == 2
         assert cfg.mode.concurrency_max == 32
@@ -119,20 +125,30 @@ class TestStressConfig:
             StressMicrobenchmarkConfig(output_length=-1)
 
     def test_warmup_exceeds_duration(self):
-        with pytest.raises(ValueError, match="point_duration must exceed warmup_duration"):
+        with pytest.raises(
+            ValueError, match="point_duration must exceed warmup_duration"
+        ):
             StressMicrobenchmarkConfig(point_duration=10, warmup_duration=10)
 
     def test_empty_concurrency_levels(self):
         with pytest.raises(ValueError, match="concurrency_levels must be non-empty"):
-            StressMicrobenchmarkConfig(mode=ManualStressModeConfig(concurrency_levels=[]))
+            StressMicrobenchmarkConfig(
+                mode=ManualStressModeConfig(concurrency_levels=[])
+            )
 
     def test_non_positive_concurrency_level(self):
         with pytest.raises(ValueError, match="all concurrency_levels must be positive"):
-            StressMicrobenchmarkConfig(mode=ManualStressModeConfig(concurrency_levels=[1, 0, 4]))
+            StressMicrobenchmarkConfig(
+                mode=ManualStressModeConfig(concurrency_levels=[1, 0, 4])
+            )
 
     def test_range_min_ge_max(self):
-        with pytest.raises(ValueError, match="concurrency_min must be less than concurrency_max"):
-            StressMicrobenchmarkConfig(mode=RangeStressModeConfig(concurrency_min=64, concurrency_max=64))
+        with pytest.raises(
+            ValueError, match="concurrency_min must be less than concurrency_max"
+        ):
+            StressMicrobenchmarkConfig(
+                mode=RangeStressModeConfig(concurrency_min=64, concurrency_max=64)
+            )
 
     def test_range_non_positive_points(self):
         with pytest.raises(ValueError, match="concurrency_points must be positive"):
@@ -190,7 +206,7 @@ class TestCommonFields:
         cfg = PrefillMicrobenchmarkConfig()
         assert cfg.model == "meta-llama/Meta-Llama-3-8B-Instruct"
         assert cfg.api_base == "http://localhost:8000/v1"
-        assert cfg.api_key == "dummy"
+        assert cfg.api_key == "mock"
         assert cfg.output_dir == "microbench_output"
         assert cfg.seed == 42
         assert cfg.request_timeout == 120

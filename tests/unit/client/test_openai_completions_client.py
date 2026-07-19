@@ -23,7 +23,7 @@ def test_openai_completions_client_sends_all_requests_to_completions() -> None:
     config = OpenAICompletionsClientConfig(
         api_base="http://example.com/v1",
         api_key="",
-        model="dummy",
+        model="mock",
     )
     client = ClientRegistry.get(
         config.get_type(),
@@ -64,13 +64,10 @@ def test_openai_completions_client_sends_all_requests_to_completions() -> None:
         requested_output=RequestedOutputSpec(text=TextOutputSpec(target_tokens=1)),
     )
 
-    result = asyncio.run(client.send_request(req, session_id=7, session_total_requests=1))
+    result = asyncio.run(
+        client.send_request(req, session_id=7, session_total_requests=1)
+    )
     assert called["count"] == 1
     assert result.success is True
     assert result.request_id == 123
     assert result.session_id == 7
-
-
-
-
-

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from veeksha.config.preflight import PreflightCheckConfig
-from veeksha.preflight.dummy_engine import DummyStreamingEngine
+from veeksha.preflight.mock_engine import MockStreamingEngine
 from veeksha.preflight.probe import probe_pacing, probe_receive_drift
 from veeksha.preflight.report import (
     CheckResult,
@@ -58,8 +58,8 @@ def test_probe_pacing_is_realtime_at_low_concurrency():
 
 
 # ------------------------------------------------------------------ engine + probe
-def test_dummy_engine_serves_and_probe_measures():
-    engine = DummyStreamingEngine(
+def test_mock_engine_serves_and_probe_measures():
+    engine = MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.03, default_chunks=10, num_loops=2
     ).start()
     try:

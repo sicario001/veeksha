@@ -54,7 +54,7 @@ class NativeTransport:
         self,
         requests: List[Request],
         concurrency: int,
-        model: str = "dummy",
+        model: str = "mock",
         path: str = "/v1/chat/completions",
         default_max_tokens: int = 16,
         timeout_s: float = 120.0,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, List
 
-from veeksha.preflight.dummy_engine import DummyStreamingEngine
+from veeksha.preflight.mock_engine import MockStreamingEngine
 from veeksha.preflight.probe import probe_pacing, probe_receive_drift
 from veeksha.preflight.report import CheckResult, ConcurrencyPoint, PreflightReport
 from veeksha.logger import init_logger
@@ -66,7 +66,7 @@ def run_preflight_check(config: "PreflightCheckConfig") -> PreflightReport:
     prefill_s = config.prefill_ms / 1000.0
 
     engine_loops = config.engine_loops or min(24, max(4, math.ceil(target / 150)))
-    engine = DummyStreamingEngine(
+    engine = MockStreamingEngine(
         chunk_dt=chunk_dt,
         prefill_s=prefill_s,
         default_chunks=config.num_chunks,

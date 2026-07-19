@@ -1,6 +1,6 @@
 """N4: end-to-end native transport for ALL modalities into the real evaluators.
 
-Each modality's requests run over the native engine (against the dummy servers)
+Each modality's requests run over the native engine (against the mock servers)
 and are scored by the same evaluator a Python-transport run would use:
   text -> TextPerformanceEvaluator (TTFT/TPOT)
   TTS  -> AudioPerformanceEvaluator (TTFA/RTF from the audio-delta timeline)
@@ -41,10 +41,10 @@ def test_native_transport_text_e2e():
     from veeksha.config.evaluator import PerformanceEvaluatorConfig
     from veeksha.evaluator.performance.text import TextPerformanceEvaluator
     from veeksha.native.transport import NativeTransport
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+    from veeksha.preflight.mock_engine import MockStreamingEngine
     from veeksha.types import ChannelModality
 
-    engine = DummyStreamingEngine(
+    engine = MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.03, default_chunks=10, num_loops=4
     ).start()
     try:
@@ -69,12 +69,12 @@ def test_native_transport_text_e2e():
 
 # --------------------------------------------------------------------- TTS
 def test_native_transport_realtime_tts_e2e():
-    from tests.helpers.dummy_realtime_tts_server import DummyRealtimeTTSServer
+    from tests.helpers.mock_realtime_tts_server import MockRealtimeTTSServer
     from veeksha.config.evaluator import PerformanceEvaluatorConfig
     from veeksha.evaluator.performance.audio import AudioPerformanceEvaluator
     from veeksha.native.transport import NativeTransport
 
-    srv = DummyRealtimeTTSServer(
+    srv = MockRealtimeTTSServer(
         num_chunks=6, chunk_bytes=4800, sample_rate=24000
     ).start()
     try:
@@ -116,7 +116,7 @@ def _stt_request(rid, wav_path, expected):
 
 
 def test_native_transport_stt_e2e(tmp_path: Path):
-    from tests.helpers.dummy_stt_server import DummySTTServer
+    from tests.helpers.mock_stt_server import MockSTTServer
     from veeksha.config.evaluator import PerformanceEvaluatorConfig
     from veeksha.evaluator.performance.audio import AudioPerformanceEvaluator
     from veeksha.native.transport import NativeTransport
@@ -128,7 +128,7 @@ def test_native_transport_stt_e2e(tmp_path: Path):
         w.setframerate(16000)
         w.writeframes(b"\x00\x00" * 16000)  # 1s of silence
 
-    srv = DummySTTServer(
+    srv = MockSTTServer(
         transcript="the quick brown fox", first_delta_delay=0.03, delta_dt=0.02
     ).start()
     try:

@@ -1,4 +1,4 @@
-"""A dummy realtime STT WebSocket server (vllm_realtime protocol) for tests.
+"""A mock realtime STT WebSocket server (vllm_realtime protocol) for tests.
 
 Speaks the minimal vLLM realtime contract the STTClient expects: on connect it
 sends ``session.created``, then streams a few ``transcription.delta`` messages
@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 import websockets
 
 
-class DummySTTServer:
+class MockSTTServer:
     def __init__(
         self,
         transcript: str = "the quick brown fox",
@@ -70,7 +70,7 @@ class DummySTTServer:
         finally:
             task.cancel()
 
-    def start(self) -> "DummySTTServer":
+    def start(self) -> "MockSTTServer":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
@@ -93,7 +93,7 @@ class DummySTTServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="dummy-stt")
+        t = threading.Thread(target=_run, daemon=True, name="mock-stt")
         t.start()
         self._threads.append(t)
         ready.wait(timeout=5.0)

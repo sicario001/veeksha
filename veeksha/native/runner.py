@@ -112,7 +112,7 @@ def execute_native(
         return transport.run_text(
             requests,
             concurrency=concurrency,
-            model=getattr(client_config, "model", "dummy") or "dummy",
+            model=getattr(client_config, "model", "mock") or "mock",
             timeout_s=timeout_s,
             dispatch_offsets_s=dispatch_offsets_s,
             num_threads=num_threads,

@@ -15,10 +15,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _dummy_engine(num_chunks=10):
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+def _mock_engine(num_chunks=10):
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
-    return DummyStreamingEngine(
+    return MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.03, default_chunks=num_chunks, num_loops=4
     ).start()
 
@@ -44,7 +44,7 @@ def test_text_requests_run_through_native_into_text_evaluator():
     from veeksha.native.text_transport import run_text_requests
     from veeksha.types import ChannelModality
 
-    engine = _dummy_engine(num_chunks=10)
+    engine = _mock_engine(num_chunks=10)
     try:
         requests = [_text_request(i, tokens=10) for i in range(12)]
         results = run_text_requests(

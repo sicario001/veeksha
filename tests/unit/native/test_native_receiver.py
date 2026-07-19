@@ -15,11 +15,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_native_receive_drift_against_dummy_engine():
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+def test_native_receive_drift_against_mock_engine():
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
     chunk_ms, prefill_ms, num_chunks = 20.0, 30.0, 12
-    engine = DummyStreamingEngine(
+    engine = MockStreamingEngine(
         chunk_dt=chunk_ms / 1000,
         prefill_s=prefill_ms / 1000,
         default_chunks=num_chunks,

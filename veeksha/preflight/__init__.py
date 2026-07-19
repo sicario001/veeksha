@@ -3,7 +3,7 @@
 Before running a real benchmark on a system, `veeksha validate-preflight` measures
 how far *this machine* can be trusted: the maximum concurrency at which Veeksha's
 own timing instrumentation stays accurate. It drives the real client/dispatch/
-completion pipeline against a built-in streaming dummy engine with a known emit
+completion pipeline against a built-in streaming mock engine with a known emit
 schedule, so any drift between the engine's schedule and Veeksha's recorded
 timings is attributable to the harness — not a real model.
 

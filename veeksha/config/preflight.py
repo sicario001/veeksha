@@ -10,7 +10,7 @@ from veeksha.cli.base import VeekshaCommand
 @frozen_dataclass
 class PreflightCheckConfig(VeekshaCommand, name="preflight"):
     """Validate that this system can measure timings faithfully at a target
-    concurrency, BEFORE running a real benchmark. Uses a built-in streaming dummy
+    concurrency, BEFORE running a real benchmark. Uses a built-in streaming mock
     engine (no GPU, no model, no network)."""
 
     target_concurrency: int = field(
@@ -44,7 +44,7 @@ class PreflightCheckConfig(VeekshaCommand, name="preflight"):
         50.0, help="Synthetic prefill delay before first chunk (ms)."
     )
     engine_loops: int = field(
-        0, help="Dummy-engine accept loops. 0 = auto-size from target_concurrency."
+        0, help="Mock-engine accept loops. 0 = auto-size from target_concurrency."
     )
     budget_s: float = field(
         4.0, help="Approx wall-time budget per concurrency point (s)."
@@ -59,7 +59,7 @@ class PreflightCheckConfig(VeekshaCommand, name="preflight"):
         False,
         help="Also measure per-chunk receive drift on the REAL realtime-audio "
         "WebSocket transport (drives the actual RealtimeTTSClient against a "
-        "fixed-cadence dummy server). Off by default: pulls the client package.",
+        "fixed-cadence mock server). Off by default: pulls the client package.",
     )
     compare_native: bool = field(
         False,

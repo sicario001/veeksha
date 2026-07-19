@@ -1,7 +1,7 @@
 """End-to-end: the real ASR/STT pipeline (WS client + workers + audio evaluator).
 
 Proves an ASR benchmark runs from this branch: STTClient streams a WAV clip to
-the dummy realtime STT server, receives the transcript, and the audio metrics
+the mock realtime STT server, receives the transcript, and the audio metrics
 (RTF from processing-latency / input-audio-duration) land in the
 AudioPerformanceEvaluator. Needs `transformers` importable (client package);
 runs in CI, and locally with PYTHONPATH=analysis/bench/_shim.
@@ -17,7 +17,7 @@ import wave
 from pathlib import Path
 from queue import Queue
 
-from tests.helpers.dummy_stt_server import DummySTTServer
+from tests.helpers.mock_stt_server import MockSTTServer
 from veeksha.config.client import STTClientConfig
 from veeksha.config.evaluator import PerformanceEvaluatorConfig
 from veeksha.config.traffic import ConcurrentTrafficConfig
@@ -86,7 +86,7 @@ def test_stt_end_to_end_produces_transcript_and_metrics(tmp_path: Path):
     wav = str(tmp_path / "clip.wav")
     _make_wav(wav, seconds=1.0, sr=16000)  # 1s -> 32000 PCM bytes
 
-    srv = DummySTTServer(
+    srv = MockSTTServer(
         transcript="the quick brown fox", first_delta_delay=0.04, delta_dt=0.02
     ).start()
     try:
@@ -172,7 +172,7 @@ def test_stt_end_to_end_scores_wer_when_ground_truth_present(tmp_path: Path):
     wav = str(tmp_path / "clip.wav")
     _make_wav(wav, seconds=1.0, sr=16000)
 
-    srv = DummySTTServer(
+    srv = MockSTTServer(
         transcript="the quick brown fox", first_delta_delay=0.04, delta_dt=0.02
     ).start()
     try:

@@ -29,7 +29,7 @@ class BaseMicrobenchmarkConfig:
 
     model: str = field("meta-llama/Meta-Llama-3-8B-Instruct", help="Model name")
     api_base: str = field("http://localhost:8000/v1", help="API base URL")
-    api_key: str = field("dummy", help="API key")
+    api_key: str = field("mock", help="API key")
     input_lengths: list[int] = field(
         default_factory=lambda: [128, 256, 512, 1024],
         help="Input lengths for benchmarks",

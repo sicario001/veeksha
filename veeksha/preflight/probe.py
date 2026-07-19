@@ -1,7 +1,7 @@
 """Probes that measure Veeksha's timing preflight at a given concurrency.
 
 `probe_receive_drift` drives the REAL client/dispatch/completion pipeline against
-the dummy engine and reports how faithfully Veeksha recorded the (known) chunk
+the mock engine and reports how faithfully Veeksha recorded the (known) chunk
 cadence. `probe_pacing` measures whether this system can sustain accurate
 real-time send pacing (as used for streaming-audio / ASR benchmarks) at a given
 concurrency — a pure asyncio scheduling probe.
@@ -105,7 +105,7 @@ def probe_receive_drift(
     client_cfg = OpenAIChatCompletionsClientConfig(
         api_base=f"http://127.0.0.1:{engine.port}/v1",
         api_key="none",
-        model="dummy",
+        model="mock",
         request_timeout=120,
         max_connections=max_connections,
     )
@@ -289,7 +289,7 @@ def probe_audio_transport(
     """Per-chunk receive drift on the REAL realtime-audio WebSocket transport.
 
     The audio analogue of ``probe_receive_drift`` (which covers SSE): drive the
-    actual ``RealtimeTTSClient`` against a fixed-cadence dummy realtime server at
+    actual ``RealtimeTTSClient`` against a fixed-cadence mock realtime server at
     ``concurrency`` and measure how faithfully the client's own per-chunk arrival
     timeline reproduces the known ``chunk_ms`` cadence. This exercises the real WS
     receive path (framing, base64 decode, timestamping) rather than a synthetic
@@ -304,10 +304,10 @@ def probe_audio_transport(
     from veeksha.client.realtime_tts import RealtimeTTSClient
     from veeksha.config.client import RealtimeTTSClientConfig
     from veeksha.core.audio_contract import AudioMetricKey
-    from veeksha.preflight.audio_server import DummyRealtimeAudioServer
+    from veeksha.preflight.audio_server import MockRealtimeAudioServer
 
     chunk_dt_ms = chunk_ms
-    server = DummyRealtimeAudioServer(
+    server = MockRealtimeAudioServer(
         num_chunks=num_chunks, chunk_dt=chunk_ms / 1000.0
     ).start()
     try:
@@ -377,7 +377,7 @@ def probe_stt_transport(
 
     For ASR the interactivity-critical drift is on the SEND side: veeksha must
     stream the input audio at 1x real time (a 90s clip should take 90s to send).
-    We measure this at the ground-truth point — a dummy server timestamps each
+    We measure this at the ground-truth point — a mock server timestamps each
     ``input_audio_buffer.append`` on arrival — while driving the actual STTClient
     at ``concurrency``. So this exercises the real WS send path (encode + paced
     ws.send), not a synthetic model.
@@ -392,9 +392,9 @@ def probe_stt_transport(
     from veeksha.client.stt import STTClient
     from veeksha.config.client import STTClientConfig
     from veeksha.core.request_content import AudioChannelRequestContent
-    from veeksha.preflight.audio_server import DummySTTPreflightServer
+    from veeksha.preflight.audio_server import MockSTTPreflightServer
 
-    server = DummySTTPreflightServer().start()
+    server = MockSTTPreflightServer().start()
     tmpdir = tempfile.mkdtemp()
     wav_path = os.path.join(tmpdir, "clip.wav")
     with wave.open(wav_path, "wb") as w:

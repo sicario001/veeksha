@@ -1,6 +1,6 @@
 """Validation tests for streamed-chunk receive-time drift (Task 3).
 
-Codifies analysis/03_dispatcher_drift.md. A dummy streaming "engine" emits
+Codifies analysis/03_dispatcher_drift.md. A mock streaming "engine" emits
 chunks on an ABSOLUTE schedule (ground truth). Client coroutines share a single
 asyncio event loop and timestamp each chunk on receipt — mirroring
 veeksha/client/openai_chat.py:400. We measure drift = recorded_receive_time -

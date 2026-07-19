@@ -1,4 +1,4 @@
-"""Built-in streaming dummy engine with a known emit schedule.
+"""Built-in streaming mock engine with a known emit schedule.
 
 An OpenAI-compatible SSE endpoint that emits chunks on an absolute schedule
 (prefill delay, then a fixed inter-chunk cadence). Because the schedule is known,
@@ -22,7 +22,7 @@ from veeksha.logger import init_logger
 logger = init_logger(__name__)
 
 
-class DummyStreamingEngine:
+class MockStreamingEngine:
     """Localhost streaming SSE engine with a deterministic emit schedule."""
 
     def __init__(
@@ -133,7 +133,7 @@ class DummyStreamingEngine:
         return self.default_chunks
 
     # --------------------------------------------------------------- lifecycle
-    def start(self) -> "DummyStreamingEngine":
+    def start(self) -> "MockStreamingEngine":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]

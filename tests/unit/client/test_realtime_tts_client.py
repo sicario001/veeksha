@@ -1,6 +1,6 @@
 """Tests for the realtime (WebSocket) TTS client.
 
-Protocol-shape units plus an end-to-end run against a dummy realtime TTS server
+Protocol-shape units plus an end-to-end run against a mock realtime TTS server
 that proves the client streams paced text deltas, collects audio deltas with a
 per-chunk receive timeline, and emits the shared audio-contract metrics that the
 AudioPerformanceEvaluator consumes. Needs `transformers` importable (client
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 
-from tests.helpers.dummy_realtime_tts_server import DummyRealtimeTTSServer
+from tests.helpers.mock_realtime_tts_server import MockRealtimeTTSServer
 from veeksha.config.client import RealtimeTTSClientConfig
 from veeksha.core.audio_contract import AudioMetricKey
 from veeksha.core.request import Request
@@ -67,7 +67,7 @@ def test_extract_audio_decodes_base64():
 
 # ------------------------------------------------------------------ end to end
 def test_realtime_tts_end_to_end_collects_audio_and_metrics():
-    srv = DummyRealtimeTTSServer(
+    srv = MockRealtimeTTSServer(
         num_chunks=5,
         chunk_bytes=4800,
         first_delta_delay=0.03,
@@ -119,7 +119,7 @@ def test_realtime_tts_end_to_end_collects_audio_and_metrics():
 
 def test_realtime_tts_metrics_feed_audio_evaluator():
     """The realtime timeline drives the AudioPerformanceEvaluator's streaming RTF."""
-    srv = DummyRealtimeTTSServer(num_chunks=6, chunk_bytes=4800).start()
+    srv = MockRealtimeTTSServer(num_chunks=6, chunk_bytes=4800).start()
     try:
         from veeksha.client.realtime_tts import RealtimeTTSClient
         from veeksha.config.evaluator import PerformanceEvaluatorConfig

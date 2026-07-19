@@ -1,6 +1,6 @@
 """A minimal fixed-cadence realtime-TTS WebSocket server for the audio preflight.
 
-The audio analogue of ``DummyStreamingEngine``: it emits audio deltas on a known
+The audio analogue of ``MockStreamingEngine``: it emits audio deltas on a known
 schedule so the preflight can measure how faithfully the REAL realtime client
 records per-chunk arrival timing over an actual WebSocket transport. Speaks just
 enough of the OpenAI-realtime contract that ``RealtimeTTSClient`` accepts it.
@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 import websockets
 
 
-class DummyRealtimeAudioServer:
+class MockRealtimeAudioServer:
     """Emits ``num_chunks`` audio deltas ``chunk_dt`` apart on response.create."""
 
     def __init__(
@@ -106,7 +106,7 @@ class DummyRealtimeAudioServer:
             if audio_task is not None:
                 audio_task.cancel()
 
-    def start(self) -> "DummyRealtimeAudioServer":
+    def start(self) -> "MockRealtimeAudioServer":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
@@ -145,7 +145,7 @@ class DummyRealtimeAudioServer:
             t.join(timeout=2.0)
 
 
-class DummySTTPreflightServer:
+class MockSTTPreflightServer:
     """STT WebSocket server that RECORDS where the client's audio actually lands.
 
     For ASR the interactivity-critical drift is on the *send* side: veeksha must
@@ -208,6 +208,7 @@ class DummySTTPreflightServer:
         arrivals: List[float] = []
         first_append: Optional[float] = None
         transcript_task: Optional[asyncio.Future] = None
+        recorded = False
         try:
             async for raw in ws:  # drain client audio; timestamp each append
                 try:
@@ -223,7 +224,12 @@ class DummySTTPreflightServer:
                         first_append = now
                     arrivals.append((now - first_append) * 1000.0)
                 elif etype == "input_audio_buffer.commit" and event.get("final"):
-                    # client EOF: full audio received -> now emit the transcript
+                    # client EOF: full audio received. Record the arrival timeline
+                    # HERE (deterministic — before the connection closes) so the
+                    # measurement never races the close, then emit the transcript.
+                    if not recorded and arrivals:
+                        self.append_arrivals.append(list(arrivals))
+                        recorded = True
                     if transcript_task is None:
                         transcript_task = asyncio.ensure_future(_emit_transcript())
         except Exception:
@@ -231,10 +237,10 @@ class DummySTTPreflightServer:
         finally:
             if transcript_task is not None:
                 transcript_task.cancel()
-            if arrivals:
+            if not recorded and arrivals:  # client that closed without a final commit
                 self.append_arrivals.append(arrivals)
 
-    def start(self) -> "DummySTTPreflightServer":
+    def start(self) -> "MockSTTPreflightServer":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]

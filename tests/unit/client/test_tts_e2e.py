@@ -1,7 +1,7 @@
 """End-to-end: the real TTS pipeline (client + workers + audio evaluator).
 
 Proves a TTS benchmark runs from this branch: TTSClient streams audio from the
-dummy TTS server through the real dispatch/completion workers into the
+mock TTS server through the real dispatch/completion workers into the
 AudioPerformanceEvaluator, which produces TTFA/RTF/duration. Needs `transformers`
 importable (the veeksha.client package pulls it in); runs in CI, and locally with
 PYTHONPATH=analysis/bench/_shim.
@@ -14,7 +14,7 @@ import threading
 import time
 from queue import Queue
 
-from tests.helpers.dummy_tts_server import DummyTTSServer
+from tests.helpers.mock_tts_server import MockTTSServer
 from veeksha.config.client import TTSClientConfig
 from veeksha.config.evaluator import PerformanceEvaluatorConfig
 from veeksha.config.traffic import ConcurrentTrafficConfig
@@ -68,7 +68,7 @@ def _tts_session(sid: int) -> Session:
 
 
 def test_tts_end_to_end_produces_audio_metrics():
-    srv = DummyTTSServer(
+    srv = MockTTSServer(
         chunk_bytes=4800, num_chunks=10, chunk_dt=0.02, prefill_s=0.02
     ).start()
     try:

@@ -42,9 +42,9 @@ def test_maybe_run_native_text_bounded_batch():
     from veeksha.config.runtime import RuntimeConfig
     from veeksha.config.traffic import ConcurrentTrafficConfig
     from veeksha.evaluator.performance.base import PerformanceEvaluator
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
-    engine = DummyStreamingEngine(
+    engine = MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.03, default_chunks=10, num_loops=4
     ).start()
     try:

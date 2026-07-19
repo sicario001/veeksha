@@ -1,4 +1,4 @@
-"""A dummy HTTP TTS server for end-to-end tests.
+"""A mock HTTP TTS server for end-to-end tests.
 
 Responds to ``POST /v1/audio/speech`` by streaming raw PCM audio bytes on a known
 schedule (prefill delay, then fixed-size chunks at a fixed cadence). Because the
@@ -15,7 +15,7 @@ import time
 from typing import List, Optional, Tuple
 
 
-class DummyTTSServer:
+class MockTTSServer:
     def __init__(
         self,
         chunk_bytes: int = 4800,
@@ -84,7 +84,7 @@ class DummyTTSServer:
         except Exception:
             pass
 
-    def start(self) -> "DummyTTSServer":
+    def start(self) -> "MockTTSServer":
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.bind((self.host, 0))
         self.port = s.getsockname()[1]
@@ -114,7 +114,7 @@ class DummyTTSServer:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True, name="dummy-tts")
+        t = threading.Thread(target=_run, daemon=True, name="mock-tts")
         t.start()
         self._threads.append(t)
         ready.wait(timeout=5.0)

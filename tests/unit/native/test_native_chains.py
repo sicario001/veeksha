@@ -21,10 +21,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _dummy_engine(num_chunks=5):
-    from veeksha.preflight.dummy_engine import DummyStreamingEngine
+def _mock_engine(num_chunks=5):
+    from veeksha.preflight.mock_engine import MockStreamingEngine
 
-    return DummyStreamingEngine(
+    return MockStreamingEngine(
         chunk_dt=0.02, prefill_s=0.02, default_chunks=num_chunks, num_loops=4
     ).start()
 
@@ -35,7 +35,7 @@ def _turn(num_chunks: int) -> NativeRequest:
 
 
 def test_native_chains_run_all_dependent_turns():
-    engine_srv = _dummy_engine(num_chunks=5)
+    engine_srv = _mock_engine(num_chunks=5)
     try:
         engine = NativeReceiveEngine("127.0.0.1", engine_srv.port)
         chains = [[_turn(5), _turn(5), _turn(5)] for _ in range(6)]
@@ -55,7 +55,7 @@ def test_native_chains_run_all_dependent_turns():
 
 def test_native_coupling_handoff_is_sub_millisecond():
     """The receive->dispatch handoff is native (no Python queue jitter)."""
-    engine_srv = _dummy_engine(num_chunks=4)
+    engine_srv = _mock_engine(num_chunks=4)
     try:
         engine = NativeReceiveEngine("127.0.0.1", engine_srv.port)
         chains = [[_turn(4), _turn(4), _turn(4), _turn(4)] for _ in range(8)]
