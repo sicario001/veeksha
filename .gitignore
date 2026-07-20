@@ -277,3 +277,5 @@ microbench_output*
 
 # uv lock file
 uv.lock
+# local scratch: design docs, benches, experiment results (not part of the deliverable)
+analysis/

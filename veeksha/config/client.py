@@ -29,6 +29,13 @@ class BaseClientConfig(BasePolyConfig):
     request_timeout: int = field(
         300, help="The timeout for each request to the LLM API (in seconds)."
     )
+    max_connections: Optional[int] = field(
+        None,
+        help="Max concurrent HTTP connections in each client worker's httpx pool. "
+        "None = unlimited (correct for load generation). httpx's own default is 100, "
+        "which silently caps in-flight requests at num_client_threads*100 and corrupts "
+        "high-concurrency timings.",
+    )
     additional_sampling_params: str = field(
         "{}",
         help="Additional sampling params to send with each request to the LLM API.",

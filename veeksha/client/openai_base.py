@@ -42,10 +42,21 @@ class OpenAIBaseClient(BaseLLMClient):
         return len(self.text_tokenizer_handle.encode(text))
 
     def _get_client(self) -> httpx.AsyncClient:
-        """Get or create a thread-local httpx client."""
+        """Get or create a thread-local httpx client.
+
+        The connection-pool size is set from ``config.max_connections`` (``None``
+        = unlimited).  httpx's implicit default is 100, which caps in-flight
+        requests per worker and throttles high-concurrency benchmarks; unlimited
+        is the correct default for a load generator.
+        """
         if not hasattr(self.client_storage, "client"):
+            max_conns = getattr(self.config, "max_connections", None)
             self.client_storage.client = httpx.AsyncClient(
-                timeout=self.config.request_timeout
+                timeout=self.config.request_timeout,
+                limits=httpx.Limits(
+                    max_connections=max_conns,
+                    max_keepalive_connections=max_conns,
+                ),
             )
         return self.client_storage.client
 

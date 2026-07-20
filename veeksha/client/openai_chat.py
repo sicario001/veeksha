@@ -295,6 +295,10 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
 
         buffer = ""
         async for chunk in response.aiter_text():
+            # Stamp when the bytes arrive, before framing and JSON parsing, so
+            # the recorded arrival time is the server's, not ours plus our own
+            # decode cost.
+            read_time = time.monotonic()
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
@@ -306,9 +310,10 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
                     if data_str == "[DONE]":
                         return
                     try:
-                        yield json.loads(data_str)
+                        parsed = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+                    yield parsed, read_time
 
     async def send_request(
         self,
@@ -396,8 +401,7 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
                     on_request_dispatched()
 
                 sent_notified = False
-                async for data in self._process_stream(response):
-                    receive_time = time.monotonic()
+                async for data, receive_time in self._process_stream(response):
                     if "error" in data:
                         err = data.get("error") or {}
                         error_msg = err.get("message", "Unknown error")

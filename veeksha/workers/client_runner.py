@@ -135,7 +135,12 @@ class ClientWorker:
                 on_request_sent=_on_request_sent,
                 on_request_dispatched=_on_request_dispatched,
             )
-            if ordering == "request" and tracker is not None:
+            # Advance unconditionally once the request is over: clients that
+            # swallow transport failures into an error result never fire the
+            # dispatch/prefill callbacks, and a stuck ticket would deadlock every
+            # subsequent request. advance() is idempotent (monotonic max), so
+            # this is a no-op when a callback already advanced the ticket.
+            if tracker is not None:
                 tracker.advance(request.dispatch_ticket)
         except Exception as e:
             logger.exception(

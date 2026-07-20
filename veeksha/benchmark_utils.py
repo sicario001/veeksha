@@ -1,6 +1,7 @@
 """Utilities used by the benchmark runner."""
 
 import hashlib
+import math
 import os
 import shutil
 import time
@@ -27,7 +28,50 @@ __all__ = [
     "build_evaluator",
     "maybe_run_warmup",
     "_monitor_for_completion",
+    "recommended_client_threads",
+    "maybe_warn_client_thread_sizing",
 ]
+
+# One Python asyncio event loop stays timing-accurate up to roughly this many
+# concurrent streams before drift climbs (measured on the real pipeline
+# against a known-cadence mock server).
+STREAMS_PER_EVENT_LOOP = 300
+
+
+def recommended_client_threads(target_concurrency: int) -> int:
+    """Suggested ``num_client_threads`` to keep timings honest at a concurrency.
+
+    Each client-worker asyncio loop stays accurate up to ~``STREAMS_PER_EVENT_LOOP``
+    concurrent streams, so spread the target across ``ceil(target / that)`` loops.
+    """
+    if target_concurrency <= 0:
+        return 1
+    return max(1, math.ceil(target_concurrency / STREAMS_PER_EVENT_LOOP))
+
+
+def maybe_warn_client_thread_sizing(benchmark_config: BenchmarkConfig) -> None:
+    """Warn if num_client_threads is too low for a concurrent target to stay honest."""
+    from veeksha.config.traffic import ConcurrentTrafficConfig
+
+    scheduler = benchmark_config.traffic_scheduler
+    if not isinstance(scheduler, ConcurrentTrafficConfig):
+        return
+    target = scheduler.target_concurrent_sessions
+    n_threads = benchmark_config.runtime.num_client_threads
+    recommended = recommended_client_threads(target)
+    if n_threads < recommended:
+        logger.warning(
+            "num_client_threads=%d may be too low for target_concurrent_sessions=%d: "
+            "each asyncio loop stays timing-accurate up to ~%d streams, so recommend "
+            "num_client_threads >= %d. Validate first with "
+            "`veeksha preflight --target_concurrency %d --num_client_threads %d`.",
+            n_threads,
+            target,
+            STREAMS_PER_EVENT_LOOP,
+            recommended,
+            target,
+            n_threads,
+        )
 
 
 def _persist_config_yaml(benchmark_config: BenchmarkConfig) -> str:

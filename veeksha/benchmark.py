@@ -10,6 +10,7 @@ from veeksha.benchmark_utils import (
     _monitor_for_completion,
     build_evaluator,
     maybe_run_warmup,
+    maybe_warn_client_thread_sizing,
 )
 from veeksha.client.registry import ClientRegistry
 from veeksha.config.benchmark import BenchmarkConfig
@@ -195,6 +196,9 @@ def _run_benchmark(
     """
 
     seed_manager = SeedManager(benchmark_config.seed)
+
+    # Warn early if the client-thread count is undersized for the target concurrency.
+    maybe_warn_client_thread_sizing(benchmark_config)
 
     # get session generator
     model_name = benchmark_config.client.model
