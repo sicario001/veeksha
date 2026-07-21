@@ -41,6 +41,25 @@ class BaseClientConfig(BasePolyConfig):
         "{}",
         help="Additional sampling params to send with each request to the LLM API.",
     )
+    use_native_transport: bool = field(
+        False,
+        help="Route this client's requests through the native (C++) transport when "
+        "available and the endpoint is plaintext (http/ws). The native engine owns "
+        "connection concurrency + kernel-time receive/send timing, removing the "
+        "Python per-event overhead that corrupts high-concurrency measurements. "
+        "Falls back to the Python transport otherwise (e.g. https/wss).",
+    )
+    native_threads: int = field(
+        0,
+        help="Number of native poll-loop threads to shard connections across "
+        "(true parallel on free-threaded CPython). 0 = auto: 1 loop below ~200 "
+        "concurrent streams, 2 above it — sharding roughly halves userspace "
+        "read-batching drift once a single loop services many sockets per poll, "
+        "while 2 threads stays safe even against a co-located server. Set an "
+        "explicit value to override; raise it further only when the server is on "
+        "its own host. Only used when use_native_transport is set.",
+    )
+
     def __post_init__(self):
         self.additional_sampling_params_dict = {}
         if self.additional_sampling_params:

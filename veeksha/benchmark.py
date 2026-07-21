@@ -66,6 +66,137 @@ def _maybe_pregenerate_sessions(benchmark_config, session_generator) -> Optional
     return pregenerated_sessions
 
 
+def _maybe_run_native(
+    benchmark_config,
+    evaluator,
+    session_generator,
+    pregenerated_sessions,
+    seed_manager=None,
+):
+    """Run the batch over the native (C++) transport when the client opts in.
+
+    Returns ``(result, sessions)``: the finalized EvaluationResult (or None to
+    fall back to the Python worker pipeline) plus any sessions drawn from the
+    generator while deciding — the caller must hand those to the Python path as
+    pregenerated sessions so a fallback run sees the exact same workload.
+
+    Native owns connection concurrency + read-time receive timing AND (for
+    rate-based traffic) the arrival-dispatch timing, so this path removes the
+    Python per-event overhead on both ends.
+
+    Guards / fallbacks (kept on the Python transport):
+      - non-bounded runs (max_sessions <= 0);
+      - multi-turn sessions that are NOT linear text conversations (DAGs,
+        delayed roots, non-text channels) — the native chains engine owns
+        linear history flow (turn N's output spliced into turn N+1's prompt
+        natively); anything richer stays on the Python history path.
+    """
+    from veeksha.native.runner import (
+        compute_chain_start_offsets,
+        compute_dispatch_offsets,
+        feed_native_chain_results,
+        feed_native_results,
+        sessions_chain_eligible,
+        should_use_native,
+    )
+
+    client_config = benchmark_config.client
+    if not should_use_native(client_config):
+        return None, pregenerated_sessions
+    max_sessions = benchmark_config.runtime.max_sessions
+    if max_sessions <= 0:
+        logger.warning(
+            "use_native_transport is set but max_sessions <= 0; the native path "
+            "needs a bounded run. Falling back to the Python pipeline."
+        )
+        return None, pregenerated_sessions
+
+    sessions = pregenerated_sessions
+    if sessions is None:
+        sessions = []
+        for _ in range(max_sessions):
+            try:
+                sessions.append(session_generator.generate_session())
+            except StopIteration:
+                break
+
+    # Multi-turn: linear text conversations run on the native chains engine
+    # (history spliced natively between turns). Anything richer — DAG sessions,
+    # delayed roots, non-text channels — keeps the Python history path.
+    if any(len(s.requests) > 1 for s in sessions):
+        from veeksha.types import ClientType
+
+        is_text_client = client_config.get_type() in (
+            ClientType.OPENAI_CHAT_COMPLETIONS,
+            ClientType.OPENAI_COMPLETIONS,
+        )
+        if not (is_text_client and sessions_chain_eligible(sessions)):
+            logger.info(
+                "Native transport skipped: multi-turn sessions are not linear "
+                "text chains (Python pipeline handles these)."
+            )
+            return None, sessions
+        concurrency = getattr(
+            benchmark_config.traffic_scheduler, "target_concurrent_sessions", 0
+        ) or min(len(sessions), 64)
+        start_offsets = None
+        if seed_manager is not None:
+            start_offsets = compute_chain_start_offsets(
+                sessions, benchmark_config.traffic_scheduler, seed_manager
+            )
+        if start_offsets is not None:
+            concurrency = len(sessions)  # open-loop: arrival schedule = load
+        logger.info(
+            "Native transport (chains): %d sessions, concurrency %d, %s (%s)",
+            len(sessions),
+            concurrency,
+            "open-loop chain starts" if start_offsets else "closed-loop",
+            client_config.get_type(),
+        )
+        feed_native_chain_results(
+            sessions,
+            evaluator,
+            client_config,
+            concurrency,
+            start_offsets_s=start_offsets,
+        )
+        return evaluator.finalize(), sessions
+
+    requests = [req for s in sessions for req in s.requests.values()]
+
+    # Rate-based traffic: native owns the arrival-dispatch schedule (open-loop),
+    # so QPS runs are faithful AND native-timed. Concurrent traffic: closed-loop
+    # (native fills concurrency + refills), so no per-request schedule.
+    dispatch_offsets = None
+    if seed_manager is not None:
+        dispatch_offsets = compute_dispatch_offsets(
+            sessions, benchmark_config.traffic_scheduler, seed_manager
+        )
+    if dispatch_offsets is not None:
+        # Open-loop: the arrival schedule IS the offered load — an in-flight cap
+        # below the request count would silently re-shape it into closed-loop.
+        concurrency = len(requests)
+    else:
+        concurrency = getattr(
+            benchmark_config.traffic_scheduler, "target_concurrent_sessions", 0
+        ) or min(len(requests), 64)
+    logger.info(
+        "Native transport: %d requests, concurrency %d, %s (%s)",
+        len(requests),
+        concurrency,
+        "open-loop arrival schedule" if dispatch_offsets else "closed-loop",
+        client_config.get_type(),
+    )
+    feed_native_results(
+        requests,
+        evaluator,
+        client_config,
+        concurrency,
+        dispatch_offsets_s=dispatch_offsets,
+    )
+    return evaluator.finalize(), sessions
+
+
 def _run_main_loop(
     session_generator,
     traffic_scheduler,
@@ -280,6 +411,22 @@ def _run_benchmark(
         session_generator=session_generator,
         benchmark_start_time=benchmark_start_time,
     )
+
+    # Native transport fast path: when the client opts in (and the endpoint is
+    # plaintext + the run is bounded), run the batch over the C++ engine instead
+    # of the Python worker pipeline, then finalize/save the same way.
+    native_result, pregenerated_sessions = _maybe_run_native(
+        benchmark_config,
+        evaluator,
+        session_generator,
+        pregenerated_sessions,
+        seed_manager=seed_manager,
+    )
+    if native_result is not None:
+        os.makedirs(f"{benchmark_config.output_dir}/metrics", exist_ok=True)
+        evaluator.save(f"{benchmark_config.output_dir}/metrics")
+        logger.info("Native transport run complete.")
+        return native_result
 
     # trace recorder
     trace_recorder = None
