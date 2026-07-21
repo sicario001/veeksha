@@ -99,6 +99,12 @@ class BaseTrafficScheduler:
         """
         return
 
-    def reset_reference_time(self) -> None:
-        """Optional hook invoked before the benchmark starts dispatching."""
+    def reset_reference_time(self, anchor: Optional[float] = None) -> None:
+        """Optional hook invoked before the benchmark starts dispatching.
+
+        ``anchor`` is the benchmark's ``time.monotonic()`` reference; ``None``
+        means "now". Schedulers that pace against a virtual clock re-align to
+        it so arrival schedules are anchored at benchmark start, not at
+        scheduler construction.
+        """
         return

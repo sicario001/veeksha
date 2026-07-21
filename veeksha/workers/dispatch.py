@@ -3,15 +3,14 @@
 import random
 import time
 from queue import Queue
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
 from veeksha.core.context import WorkerContext
-from veeksha.evaluator.base import BaseEvaluator
 from veeksha.logger import init_logger
 from veeksha.traffic.base import BaseTrafficScheduler
 
 if TYPE_CHECKING:
-    from veeksha.core.trace_recorder import TraceRecorder
+    from veeksha.loop.python_loop import LoopEventSink
 
 logger = init_logger(__name__)
 
@@ -21,7 +20,8 @@ class DispatchWorker:
 
     This worker:
     1. Waits for ready requests from the traffic scheduler (wait_for_ready)
-    2. Registers requests with the evaluator
+    2. Emits a DISPATCHED loop event (consumed outside the loop by the
+       scoring drain, which replays it into the evaluator / trace recorder)
     3. Dispatches requests to client worker queues
     """
 
@@ -31,24 +31,21 @@ class DispatchWorker:
         self,
         traffic_scheduler: BaseTrafficScheduler,
         client_queues: List[Queue],
-        evaluator: BaseEvaluator,
+        event_sink: "LoopEventSink",
         worker_context: WorkerContext,
-        trace_recorder: Optional["TraceRecorder"] = None,
     ):
         """Initialize the dispatch worker.
 
         Args:
             traffic_scheduler: Scheduler to poll for ready requests
             client_queues: Queues to dispatch requests to (one per client worker)
-            evaluator: Evaluator for registering request dispatch
+            event_sink: Loop-side sink receiving DISPATCHED events
             worker_context: Worker context with stop event
-            trace_recorder: Optional recorder for dispatch traces
         """
         self.traffic_scheduler = traffic_scheduler
         self.client_queues = client_queues
-        self.evaluator = evaluator
+        self.event_sink = event_sink
         self.worker_context = worker_context
-        self.trace_recorder = trace_recorder
 
     def _select_queue(self) -> Queue:
         """Select a client queue using power-of-two load balancing"""
@@ -63,6 +60,24 @@ class DispatchWorker:
 
         return q1 if q1.qsize() <= q2.qsize() else q2
 
+    def _dispatch(self, request, session_id: int, session_size: int) -> None:
+        """Stamp, record, and enqueue one ready request."""
+        scheduler_ready_at = time.monotonic()
+        dispatched_at = time.monotonic()
+
+        self.event_sink.record_dispatched(
+            request=request,
+            session_id=session_id,
+            session_size=session_size,
+            scheduler_ready_at=scheduler_ready_at,
+            dispatched_at=dispatched_at,
+        )
+
+        queue = self._select_queue()
+        queue.put(
+            (request, session_id, session_size, scheduler_ready_at, dispatched_at)
+        )
+
     def run(self) -> None:
         """Main worker loop."""
         logger.debug("Dispatch worker %s starting", self.worker_context.worker_id)
@@ -74,29 +89,7 @@ class DispatchWorker:
                 continue
 
             request, session_id, session_size = result
-            scheduler_ready_at = time.monotonic()
-            dispatched_at = time.monotonic()
-
-            self.evaluator.register_request(
-                request_id=request.id,
-                session_id=session_id,
-                dispatched_at=dispatched_at,
-                channels=request.channels,
-                requested_output=request.requested_output,
-            )
-
-            if self.trace_recorder:
-                self.trace_recorder.record_dispatch(
-                    request=request,
-                    session_id=session_id,
-                    session_size=session_size,
-                    dispatched_at=dispatched_at,
-                )
-
-            queue = self._select_queue()
-            queue.put(
-                (request, session_id, session_size, scheduler_ready_at, dispatched_at)
-            )
+            self._dispatch(request, session_id, session_size)
 
         # Drain remaining ready requests
         self._drain()
@@ -122,26 +115,4 @@ class DispatchWorker:
                 break
 
             request, session_id, session_size = result
-            scheduler_ready_at = time.monotonic()
-            dispatched_at = time.monotonic()
-
-            self.evaluator.register_request(
-                request_id=request.id,
-                session_id=session_id,
-                dispatched_at=dispatched_at,
-                channels=request.channels,
-                requested_output=request.requested_output,
-            )
-
-            if self.trace_recorder:
-                self.trace_recorder.record_dispatch(
-                    request=request,
-                    session_id=session_id,
-                    session_size=session_size,
-                    dispatched_at=dispatched_at,
-                )
-
-            queue = self._select_queue()
-            queue.put(
-                (request, session_id, session_size, scheduler_ready_at, dispatched_at)
-            )
+            self._dispatch(request, session_id, session_size)

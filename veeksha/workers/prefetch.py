@@ -1,76 +1,47 @@
 """Prefetch worker for session generation and scheduling."""
 
-import threading
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING
 
 from veeksha.core.context import WorkerContext
-from veeksha.core.session import Session
-from veeksha.generator.session.base import BaseSessionGenerator
 from veeksha.logger import init_logger
 from veeksha.traffic.base import BaseTrafficScheduler
+
+if TYPE_CHECKING:
+    from veeksha.loop.interface import SessionSource
 
 logger = init_logger(__name__)
 
 
-class SharedSessionCounter:
-    """Thread-safe shared counter for tracking sessions across workers."""
-
-    def __init__(self, max_sessions: int = -1):
-        self.max_sessions = max_sessions
-        self._count = 0
-
-    def try_increment(self) -> bool:
-        if self.max_sessions < 0:
-            self._count += 1
-            return True
-        if self._count < self.max_sessions:
-            self._count += 1
-            return True
-        return False
-
-    @property
-    def count(self) -> int:
-        return self._count
-
-
 class PrefetchWorker:
-    """Worker that generates sessions and schedules them with the traffic scheduler.
+    """Worker that pulls sessions from a source and schedules them.
 
-    This worker pulls sessions from the session generator and feeds them to the
-    traffic scheduler, which then manages the dispatch timing of individual requests.
+    This worker pulls sessions from a ``SessionSource`` (which owns generator
+    locking and max-sessions accounting) and feeds them to the traffic
+    scheduler, which then manages the dispatch timing of individual requests.
     """
 
-    # unthrottled for first 3 seconds, then throttles
+    # unthrottled for first _BURST_DURATION_S seconds, then throttles
     _BURST_DURATION_S = 5.0
     _MAX_POLL_INTERVAL_S = 0.05
 
     def __init__(
         self,
         traffic_scheduler: BaseTrafficScheduler,
-        session_generator: BaseSessionGenerator,
-        generator_lock: threading.Lock,
+        session_source: "SessionSource",
         worker_context: WorkerContext,
-        session_counter: SharedSessionCounter,
-        pregenerated_sessions: Optional[List[Session]] = None,
     ):
         """Initialize the prefetch worker.
 
         Args:
             traffic_scheduler: Scheduler to schedule sessions with
-            session_generator: Generator to get sessions from
-            generator_lock: Lock protecting the session generator
+            session_source: Thread-safe source of sessions (max_sessions
+                enforced by the source)
             worker_context: Worker context with stop event
-            session_counter: Shared counter for tracking sessions across workers
-            pregenerated_sessions: Optional list of pre-generated sessions to use
         """
         self.traffic_scheduler = traffic_scheduler
-        self.session_generator = session_generator
-        self.generator_lock = generator_lock
+        self.session_source = session_source
         self.worker_context = worker_context
-        self.session_counter = session_counter
-        self._pregenerated_sessions = pregenerated_sessions
-        self._pregenerated_index = 0
 
     def _get_poll_interval(self) -> float:
         """Calculate poll interval based on runtime duration.
@@ -85,44 +56,15 @@ class PrefetchWorker:
             return 0.0
         return self._MAX_POLL_INTERVAL_S
 
-    def _generate_session(self) -> Optional[Session]:
-        """Generate next session in a thread-safe manner."""
-        # If we have pre-generated sessions, use those
-        if self._pregenerated_sessions is not None:
-            with self.generator_lock:
-                if self._pregenerated_index >= len(self._pregenerated_sessions):
-                    return None
-                session = self._pregenerated_sessions[self._pregenerated_index]
-                self._pregenerated_index += 1
-                self.session_counter._count += 1
-                return session
-
-        # Otherwise generate on-the-fly
-        while not self.worker_context.stop_event.is_set():
-            with self.generator_lock:
-                if not self.session_counter.try_increment():
-                    return None  # exhausted
-
-                try:
-                    session = self.session_generator.generate_session()
-                    return session
-                except StopIteration:
-                    logger.debug(
-                        "Prefetch worker %s: generator exhausted",
-                        self.worker_context.worker_id,
-                    )
-                    return None
-
-        return None
-
     def run(self) -> None:
         """Main worker loop."""
         logger.debug("Prefetch worker %s starting", self.worker_context.worker_id)
 
         self._start_time = time.monotonic()
+        scheduled = 0
 
         while not self.worker_context.stop_event.is_set():
-            session = self._generate_session()
+            session = self.session_source.next_session()
             if session is None:
                 logger.info(
                     "Prefetch worker %s: no more sessions to generate",
@@ -132,12 +74,10 @@ class PrefetchWorker:
 
             # Schedule the session with traffic scheduler
             self.traffic_scheduler.schedule_session(session)
+            scheduled += 1
 
-            if self.session_counter.count % 100 == 0:
-                logger.debug(
-                    "Prefetch progress: %d sessions generated",
-                    self.session_counter.count,
-                )
+            if scheduled % 100 == 0:
+                logger.debug("Prefetch progress: %d sessions scheduled", scheduled)
 
             # Throttle (burst at start, then steady-state)
             time.sleep(self._get_poll_interval())

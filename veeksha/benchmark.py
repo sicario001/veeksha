@@ -1,10 +1,8 @@
 import os
 import sys
 import sysconfig
-import threading
 import time
 from dataclasses import replace
-from queue import Queue
 from typing import Optional, Set
 
 from veeksha.benchmark_utils import (
@@ -17,22 +15,24 @@ from veeksha.client.registry import ClientRegistry
 from veeksha.config.benchmark import BenchmarkConfig
 from veeksha.config.endpoint import EndpointConfig
 from veeksha.core.seeding import SeedManager
-from veeksha.core.thread_pool import ThreadPoolManager
 from veeksha.core.trace_recorder import TraceRecorder
+from veeksha.loop import (
+    GeneratorSessionSource,
+    MainLoopConfig,
+    PregeneratedSessionSource,
+    ResultDrain,
+    create_main_loop,
+)
 from veeksha.generator.session.registry import SessionGeneratorRegistry
 from veeksha.health import HealthChecker
 from veeksha.logger import init_logger
 from veeksha.orchestration.benchmark_orchestrator import managed_server
-from veeksha.traffic.registry import TrafficSchedulerRegistry
 from veeksha.wandb_integration import (
     maybe_finish_wandb_run,
     maybe_init_wandb_run,
     maybe_log_benchmark_artifacts,
     maybe_log_benchmark_scalars,
 )
-from veeksha.workers import CompletionWorker, DispatchWorker, PrefetchWorker
-from veeksha.workers.client_runner import ClientRunnerManager
-from veeksha.workers.prefetch import SharedSessionCounter
 
 logger = init_logger(__name__)
 
@@ -84,111 +84,26 @@ def _maybe_pregenerate_sessions(benchmark_config, session_generator) -> Optional
 
 
 def _run_main_loop(
-    session_generator,
-    traffic_scheduler,
+    loop,
+    result_drain: ResultDrain,
+    source,
     evaluator,
-    client,
     runtime_config,
-    trace_recorder=None,
-    benchmark_start_time: Optional[float] = None,
-    pregenerated_sessions: Optional[list] = None,
+    benchmark_start_time: float,
 ) -> None:
-    """Run the main benchmark loop with all workers."""
+    """Run the main loop with the scoring drain and completion monitor."""
     logger.info("Starting main loop")
     _warn_if_gil_enabled("benchmark start")
-    if benchmark_start_time is None:
-        benchmark_start_time = time.monotonic()
 
-    num_client_threads = runtime_config.num_client_threads
-    if num_client_threads is None:
-        # Provision client workers for the offered load (the sweep planner
-        # already does this; direct configs get the same protection): an
-        # under-provisioned pool serializes per-session sends and shows up
-        # as phantom server-side latency at high concurrency.
-        target_sessions = getattr(
-            traffic_scheduler, "target_concurrent_sessions", None
-        ) or getattr(traffic_scheduler, "_target_concurrent", None)
-        num_client_threads = (
-            max(3, -(-int(target_sessions) // 8)) if target_sessions else 3
-        )
-    client_queues = [Queue() for _ in range(num_client_threads)]
-    output_queue = Queue()
-    stop_event = threading.Event()
-    generator_lock = threading.Lock()
-
-    session_counter = SharedSessionCounter(max_sessions=runtime_config.max_sessions)
-
-    client_runner = ClientRunnerManager(
-        client=client,
-        input_queues=client_queues,
-        output_queue=output_queue,
-        stop_event=stop_event,
-        traffic_scheduler=traffic_scheduler,
-    )
-
-    pool_manager = ThreadPoolManager(stop_event=stop_event)
-
-    pool_manager.create_pool(
-        name="prefetch",
-        worker_class=PrefetchWorker,
-        worker_kwargs={
-            "traffic_scheduler": traffic_scheduler,
-            "session_generator": session_generator,
-            "generator_lock": generator_lock,
-            "session_counter": session_counter,
-            "pregenerated_sessions": pregenerated_sessions,
-        },
-        pool_size=1,
-    )
-
-    pool_manager.create_pool(
-        name="dispatch",
-        worker_class=DispatchWorker,
-        worker_kwargs={
-            "traffic_scheduler": traffic_scheduler,
-            "client_queues": client_queues,
-            "evaluator": evaluator,
-            "trace_recorder": trace_recorder,
-        },
-        pool_size=runtime_config.num_dispatcher_threads,
-    )
-
-    pool_manager.create_pool(
-        name="completion",
-        worker_class=CompletionWorker,
-        worker_kwargs={
-            "output_queue": output_queue,
-            "traffic_scheduler": traffic_scheduler,
-            "evaluator": evaluator,
-        },
-        pool_size=runtime_config.num_completion_threads,
-    )
-
-    if trace_recorder:
-        trace_recorder.start()
-
-    client_runner.start()
-    pool_manager.start_all()
-
-    logger.info(
-        f"Started {pool_manager.get_total_thread_count()} worker threads "
-        f"and {client_runner.get_worker_count()} client workers"
-    )
-
-    benchmark_start = benchmark_start_time
-    benchmark_timeout = runtime_config.benchmark_timeout
-    timeout_triggered = False
-    pre_timeout_request_ids: Set[str] = set()
+    loop.start(source)
+    result_drain.start()
 
     try:
-        pending_in_flight = _monitor_for_completion(
-            traffic_scheduler,
+        pending_in_flight: Set[int] = _monitor_for_completion(
+            loop,
             evaluator,
-            pool_manager,
-            benchmark_start,
-            benchmark_timeout,
-            timeout_triggered,
-            pre_timeout_request_ids,
+            benchmark_start_time,
+            runtime_config.benchmark_timeout,
             max_sessions=runtime_config.max_sessions,
             post_timeout_grace_seconds=runtime_config.post_timeout_grace_seconds,
         )
@@ -200,21 +115,12 @@ def _run_main_loop(
     # serialized run is at least loudly reported.
     _warn_if_gil_enabled("benchmark end")
 
-    stop_event.set()
-    pool_manager.join_pool("prefetch", timeout=1.0)
-    pool_manager.join_pool("dispatch", timeout=1.0)
-
-    if trace_recorder:
-        trace_recorder.stop()
-
-    logger.info("Stopping client runner...")
-    client_runner.stop()
-    if not pending_in_flight:
-        client_runner.wait()
-
-    for _ in range(runtime_config.num_completion_threads):
-        output_queue.put(None)
-    pool_manager.join_pool("completion", timeout=1.0)
+    # grace_s < 0: nothing pending, drain in-flight client work in join();
+    # grace_s >= 0: the monitor already spent the grace budget on the
+    # still-in-flight requests, do not wait for them again.
+    loop.request_stop(grace_s=-1.0 if not pending_in_flight else 0.0)
+    loop.join(timeout_s=1.0)
+    result_drain.join()
 
 
 def _run_benchmark(
@@ -271,13 +177,8 @@ def _run_benchmark(
         **session_generator_kwargs,
     )
 
-    # get traffic scheduler, client
-    traffic_scheduler = TrafficSchedulerRegistry.get(
-        benchmark_config.traffic_scheduler.get_type(),
-        config=benchmark_config.traffic_scheduler,
-        seed_manager=seed_manager,
-    )
-
+    # get client (the traffic scheduler is built inside the main loop from
+    # the traffic config)
     client = ClientRegistry.get(
         benchmark_config.client.get_type(),
         config=benchmark_config.client,
@@ -293,7 +194,6 @@ def _run_benchmark(
     )
 
     benchmark_start_time = time.monotonic()
-    traffic_scheduler.reset_reference_time()
 
     # get evaluator
     evaluator = build_evaluator(
@@ -317,16 +217,41 @@ def _run_benchmark(
 
     os.makedirs(f"{benchmark_config.output_dir}/metrics", exist_ok=True)
 
+    # session intake, main loop, and scoring drain
+    if pregenerated_sessions is not None:
+        source = PregeneratedSessionSource(pregenerated_sessions)
+    else:
+        source = GeneratorSessionSource(
+            session_generator, max_sessions=benchmark_config.runtime.max_sessions
+        )
+
+    loop = create_main_loop(
+        "python",
+        MainLoopConfig(
+            runtime=benchmark_config.runtime,
+            traffic=benchmark_config.traffic_scheduler,
+            client=benchmark_config.client,
+            monotonic_anchor=benchmark_start_time,
+        ),
+        seed_manager=seed_manager,
+        tokenizer_provider=tokenizer_provider,
+        client=client,
+    )
+    result_drain = ResultDrain(
+        loop,
+        evaluator,
+        trace_recorder=trace_recorder,
+        num_threads=benchmark_config.runtime.num_completion_threads,
+    )
+
     try:
         _run_main_loop(
-            session_generator=session_generator,
-            traffic_scheduler=traffic_scheduler,
+            loop=loop,
+            result_drain=result_drain,
+            source=source,
             evaluator=evaluator,
-            client=client,
             runtime_config=benchmark_config.runtime,
-            trace_recorder=trace_recorder,
             benchmark_start_time=benchmark_start_time,
-            pregenerated_sessions=pregenerated_sessions,
         )
     finally:
         if trace_recorder:

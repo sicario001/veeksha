@@ -251,25 +251,39 @@ def _progress_writer(max_sessions: int) -> Callable[[int], None]:
 
 
 def _monitor_for_completion(
-    traffic_scheduler,
+    loop,
     evaluator,
-    pool_manager,
     benchmark_start: float,
     benchmark_timeout: float,
-    timeout_triggered: bool,
-    pre_timeout_request_ids: Set[str],
     max_sessions: int,
     post_timeout_grace_seconds: int = -1,
-) -> Set[str]:
-    """Observe worker progress and exit once requests settle.
+) -> Set[int]:
+    """Observe loop progress and exit once requests settle.
+
+    Progress and timeout bookkeeping are served loop-side: session counts
+    come from ``loop.counters()`` (exact, not trailing behind the scoring
+    drain), and the timeout path uses ``loop.dispatched_request_ids()`` /
+    ``loop.in_flight_request_ids()``. The evaluator is only used to apply
+    ``set_included_requests`` with loop-provided ids.
+
+    Args:
+        loop: MainLoop being monitored.
+        evaluator: Evaluator to apply the included-requests filter on.
+        benchmark_start: Monotonic benchmark start time.
+        benchmark_timeout: Benchmark timeout in seconds (<= 0 disables).
+        max_sessions: Session budget (for progress display only).
+        post_timeout_grace_seconds: Grace period for in-flight requests
+            after timeout. -1 waits for all, 0 exits immediately.
 
     Returns:
         Set of request IDs that were still in-flight when monitoring stopped.
     """
     pbar, time_based_progress = _init_pbar(max_sessions, benchmark_timeout)
     pbar_state = {"last_completed": 0, "last_time_update": 0}
+    timeout_triggered = False
     timeout_start: float = 0.0
-    in_flight_remaining: Set[str] = set()
+    pre_timeout_request_ids: Set[int] = set()
+    in_flight_remaining: Set[int] = set()
 
     write_progress = _progress_writer(max_sessions)
     write_progress(0)
@@ -279,8 +293,8 @@ def _monitor_for_completion(
         while True:
             time.sleep(0.1)
 
-            completed, errored, _ = evaluator.get_session_counts()
-            total_done = completed + errored
+            counters = loop.counters()
+            total_done = counters.sessions_completed + counters.sessions_errored
             elapsed = time.monotonic() - benchmark_start
 
             _update_pbar(pbar, time_based_progress, elapsed, total_done, pbar_state)
@@ -295,20 +309,17 @@ def _monitor_for_completion(
             ):
                 timeout_triggered = True
                 timeout_start = time.monotonic()
-                pre_timeout_request_ids = evaluator.get_registered_request_ids()
-                in_flight = traffic_scheduler.get_in_flight_request_ids()
+                pre_timeout_request_ids = loop.dispatched_request_ids()
+                in_flight = loop.in_flight_request_ids()
                 pending = pre_timeout_request_ids & in_flight
                 logger.info(
                     f"Benchmark timeout after {elapsed:.1f}s. "
-                    f"Captured {len(pre_timeout_request_ids)} registered requests, "
+                    f"Captured {len(pre_timeout_request_ids)} dispatched requests, "
                     f"{len(pending)} still in-flight."
                 )
 
-            prefetch_threads = pool_manager.thread_pools.get("prefetch", [])
-            all_prefetch_done = all(not t.is_alive() for t in prefetch_threads)
-
             if timeout_triggered:
-                current_in_flight = traffic_scheduler.get_in_flight_request_ids()
+                current_in_flight = loop.in_flight_request_ids()
                 remaining = pre_timeout_request_ids & current_in_flight
 
                 # Check grace period if configured
@@ -332,7 +343,7 @@ def _monitor_for_completion(
                     evaluator.set_included_requests(pre_timeout_request_ids)
                     in_flight_remaining = set()
                     break
-            elif all_prefetch_done and not traffic_scheduler.has_pending_work():
+            elif counters.intake_exhausted and counters.idle:
                 logger.info("All sessions completed")
                 in_flight_remaining = set()
                 break

@@ -2,12 +2,15 @@
 
 import time
 from queue import Empty, Queue
+from typing import TYPE_CHECKING
 
 from veeksha.core.context import WorkerContext
 from veeksha.core.response import RequestResult
-from veeksha.evaluator.base import BaseEvaluator
 from veeksha.logger import init_logger
 from veeksha.traffic.base import BaseTrafficScheduler
+
+if TYPE_CHECKING:
+    from veeksha.loop.python_loop import LoopEventSink
 
 logger = init_logger(__name__)
 
@@ -21,15 +24,17 @@ class CompletionWorker:
 
     This worker:
     1. Receives RequestResult from client output queue
-    2. Notifies traffic scheduler of completion
-    3. Records completion with evaluator
+    2. Notifies traffic scheduler of completion (loop-internal and
+       timing-critical: refills concurrency / releases next turns)
+    3. Emits a COMPLETED loop event (consumed outside the loop by the
+       scoring drain, which replays it into the evaluator)
     """
 
     def __init__(
         self,
         output_queue: Queue,
         traffic_scheduler: BaseTrafficScheduler,
-        evaluator: BaseEvaluator,
+        event_sink: "LoopEventSink",
         worker_context: WorkerContext,
     ):
         """Initialize the completion worker.
@@ -37,18 +42,20 @@ class CompletionWorker:
         Args:
             output_queue: Queue receiving RequestResult from client workers
             traffic_scheduler: Scheduler to notify of completions
-            evaluator: Evaluator to record completions with
+            event_sink: Loop-side sink receiving COMPLETED events
             worker_context: Worker context with stop event
         """
         self.output_queue = output_queue
         self.traffic_scheduler = traffic_scheduler
-        self.evaluator = evaluator
+        self.event_sink = event_sink
         self.worker_context = worker_context
 
     def _process_result(self, result: RequestResult) -> None:
         """Process a single request result."""
         result.result_processed_at = time.monotonic()
 
+        # Scheduler notification comes FIRST: it is on the refill /
+        # next-turn-release path and must not wait on anything else.
         self.traffic_scheduler.notify_completion(
             request_id=result.request_id,
             completed_at_monotonic=result.client_completed_at,  # type: ignore
@@ -56,14 +63,7 @@ class CompletionWorker:
             channel_responses=result.channels if result.success else None,
         )
 
-        error = Exception(result.error_msg) if result.error_msg else None
-        self.evaluator.record_request_completed(
-            request_id=result.request_id,
-            session_id=result.session_id,
-            completed_at=result.client_completed_at,  # type: ignore
-            response=result,
-            error=error,
-        )
+        self.event_sink.record_completed(result)
 
     def run(self) -> None:
         """Main worker loop."""
