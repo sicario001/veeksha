@@ -267,6 +267,17 @@ def test_send_request_collects_audio_and_timeline_metrics(
     assert metrics[AudioMetricKey.RESPONSE_DONE_OFFSET_MS.value] is not None
     assert metrics[AudioMetricKey.INPUT_TEXT.value] == "hello world from vajra"
 
+    # Absolute anchors (additive): request_sent stamps the first paced frame,
+    # so it is >= t_start, and each audio offset reconstructs to an absolute
+    # arrival at or after that send stamp.
+    start = metrics["request_start_monotonic"]
+    sent = metrics["request_sent_monotonic"]
+    assert isinstance(start, float)
+    assert isinstance(sent, float)
+    assert sent >= start
+    for offset, _ in metrics[AudioMetricKey.AUDIO_CHUNK_TIMESTAMPS.value]:
+        assert start + offset / 1000.0 >= sent
+
 
 @pytest.mark.unit
 def test_send_request_maps_audio_done_error_to_server_error(

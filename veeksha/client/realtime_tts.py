@@ -273,6 +273,10 @@ class RealtimeTTSClient(BaseLLMClient):
 
         error_code: Optional[int] = None
         error_msg: Optional[str] = None
+        # Absolute stamp taken immediately before the FIRST paced frame leaves;
+        # recorded, not used, by the client (the preflight pairs it with the
+        # server's receive stamp). None until the first send.
+        request_sent_monotonic: Optional[float] = None
 
         t_start = time.monotonic()
 
@@ -352,6 +356,12 @@ class RealtimeTTSClient(BaseLLMClient):
             async with asyncio.timeout(self._realtime_config.request_timeout):
                 async with self._connect() as ws:
                     ws_connect_latency = (time.monotonic() - t_start) * 1000
+                    # C2 client-side send stamp: the request starts going out at
+                    # the FIRST application frame (session.update), which is what
+                    # the mock stamps its received_at against. Stamping the first
+                    # paced frame instead would land after the mock's receive and
+                    # make the delivery lag negative.
+                    request_sent_monotonic = time.monotonic()
                     await ws.send(self._protocol.session_update_json())
                     # Analog of the HTTP-200 ack: the scheduler's dispatch pacing
                     # advances on this callback.
@@ -395,6 +405,11 @@ class RealtimeTTSClient(BaseLLMClient):
             AudioMetricKey.INPUT_CHARS.value: len(input_text),
             AudioMetricKey.INPUT_TOKENS.value: input_tokens,
             AudioMetricKey.INPUT_TEXT.value: input_text,
+            # Absolute anchors (recordings only). Chunk i arrived at
+            # request_start_monotonic + audio_chunk_timestamps[i][0]/1000;
+            # request_sent_monotonic is the C2 client-side send stamp.
+            "request_start_monotonic": t_start,
+            "request_sent_monotonic": request_sent_monotonic,
             AudioMetricKey.TEXT_DELTA_TIMESTAMPS.value: text_delta_ts,
             AudioMetricKey.AUDIO_CHUNK_TIMESTAMPS.value: audio_chunk_ts,
             AudioMetricKey.WS_CONNECT_LATENCY_MS.value: _round_ms(ws_connect_latency),

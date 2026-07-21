@@ -233,6 +233,8 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
         image_data: Optional[Any],
         audio_data: Optional[Any],
         video_data: Optional[Any],
+        request_start_monotonic: float,
+        request_sent_monotonic: Optional[float],
     ) -> dict:
         """Build channel responses for all modalities.
 
@@ -246,6 +248,12 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
             image_data: Image response data (if any).
             audio_data: Audio response data (if any).
             video_data: Video response data (if any).
+            request_start_monotonic: ``time.monotonic()`` at ``t_start`` -- the
+                instant every ``*_offset_ms``/``inter_chunk_times`` value is
+                measured from, recorded absolutely so a receive stamp can be
+                paired with the server's own send stamp.
+            request_sent_monotonic: ``time.monotonic()`` immediately before the
+                POST left the client; ``None`` if the request never went out.
 
         Returns:
             Dict mapping ChannelModality to ChannelResponse.
@@ -265,6 +273,12 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
                     "num_delta_prompt_tokens": delta_prompt_len,
                     "num_total_prompt_tokens": total_prompt_len,
                     "num_output_tokens": tokens_received,
+                    # Absolute anchors (recordings only -- no arithmetic here).
+                    # inter_chunk_times are relative to request_start_monotonic,
+                    # so chunk i arrived at request_start_monotonic +
+                    # sum(inter_chunk_times[:i+1]).
+                    "request_start_monotonic": request_start_monotonic,
+                    "request_sent_monotonic": request_sent_monotonic,
                 },
             )
 
@@ -292,11 +306,22 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
         return channels
 
     async def _process_stream(self, response: httpx.Response):
-        """Process SSE stream from server."""
+        """Process SSE stream from server, yielding ``(event, read_time)``.
+
+        The read stamp is taken the moment the bytes arrive from the
+        transport, *before* buffering, line splitting and ``json.loads`` --
+        otherwise the client's own framing and parse cost is charged to the
+        server as inter-token latency.
+
+        Every event framed out of one read shares that read's stamp (they
+        genuinely arrived together, so their inter-chunk deltas are 0.0); an
+        event split across two reads is stamped at the read that completed it.
+        """
         import json
 
         buffer = ""
         async for chunk in response.aiter_text():
+            read_time = time.monotonic()
             buffer += chunk
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
@@ -308,9 +333,10 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
                     if data_str == "[DONE]":
                         return
                     try:
-                        yield json.loads(data_str)
+                        event = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+                    yield event, read_time
 
     async def send_request(
         self,
@@ -350,6 +376,10 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
         delta_prompt_len = 0
         messages = []
         t_start = time.monotonic()
+        # Absolute stamp taken immediately before the POST leaves; recorded, not
+        # used, by the client (the preflight pairs it with the server's receive
+        # stamp). None until the request is actually on its way out.
+        request_sent_monotonic: Optional[float] = None
 
         try:
             messages, delta_prompt_len = self._build_message_content(request)
@@ -391,6 +421,7 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
             client = self._get_client()
             t_start = time.monotonic()
             most_recent_token_time = t_start
+            request_sent_monotonic = time.monotonic()
             async with client.stream(
                 "POST",
                 self.chat_address,
@@ -404,8 +435,9 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
                     on_request_dispatched()
 
                 sent_notified = False
-                async for data in self._process_stream(response):
-                    receive_time = time.monotonic()
+                # ``receive_time`` is the transport read stamp taken inside
+                # _process_stream, not a stamp taken here after framing/parsing.
+                async for data, receive_time in self._process_stream(response):
                     if "error" in data:
                         err = data.get("error") or {}
                         error_msg = err.get("message", "Unknown error")
@@ -503,6 +535,8 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
             image_data=image_data,
             audio_data=None,
             video_data=video_data,
+            request_start_monotonic=t_start,
+            request_sent_monotonic=request_sent_monotonic,
         )
 
         # Build audio channel from streamed audio chunks
@@ -519,6 +553,9 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
                     AudioMetricKey.CHUNK_COUNT.value: audio_chunk_count,
                     AudioMetricKey.RAW_PCM.value: True,
                     AudioMetricKey.SAMPLE_RATE.value: DEFAULT_AUDIO_SAMPLE_RATE,
+                    # Same absolute anchors as the TEXT channel above.
+                    "request_start_monotonic": t_start,
+                    "request_sent_monotonic": request_sent_monotonic,
                 },
             )
 

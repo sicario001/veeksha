@@ -135,10 +135,20 @@ class TTSClient(BaseLLMClient):
         ttfc: float | None = None
         chunk_count = 0
         audio_chunks: list[bytes] = []
+        # [offset_ms_from_t_start, n_bytes] per received chunk -- the same
+        # shape realtime_tts.py emits for this key, so downstream consumers
+        # read both TTS dialects uniformly.
+        audio_chunk_ts: list[list[float | int]] = []
 
         t_start = time.monotonic()
+        # Absolute anchor: the instant every audio_chunk_timestamps offset is
+        # measured from. Recorded, not used, by the client (the preflight pairs
+        # it with the server's own stamps). request_sent is stamped immediately
+        # before the POST leaves; None until then.
+        request_sent_monotonic: float | None = None
 
         try:
+            request_sent_monotonic = time.monotonic()
             async with self._get_client().stream(
                 "POST",
                 speech_request.url,
@@ -156,13 +166,15 @@ class TTSClient(BaseLLMClient):
                     if not chunk:
                         continue
                     receive_time = time.monotonic()
+                    offset_ms = (receive_time - t_start) * 1000
                     if ttfc is None:
-                        ttfc = (receive_time - t_start) * 1000
+                        ttfc = offset_ms
                     if not sent_notified and on_request_sent is not None:
                         on_request_sent()
                         sent_notified = True
 
                     audio_chunks.append(chunk)
+                    audio_chunk_ts.append([offset_ms, len(chunk)])
                     chunk_count += 1
 
                 if not sent_notified and on_request_sent is not None:
@@ -204,12 +216,17 @@ class TTSClient(BaseLLMClient):
                     AudioMetricKey.TTFC.value: round(ttfc or 0.0, 3),
                     AudioMetricKey.END_TO_END_LATENCY.value: round(total_latency_ms, 3),
                     AudioMetricKey.CHUNK_COUNT.value: chunk_count,
+                    AudioMetricKey.AUDIO_CHUNK_TIMESTAMPS.value: audio_chunk_ts,
                     AudioMetricKey.RAW_PCM.value: self.config.raw_pcm,
                     AudioMetricKey.SAMPLE_RATE.value: self.config.sample_rate,
                     AudioMetricKey.INPUT_CHARS.value: len(input_text),
                     AudioMetricKey.INPUT_TOKENS.value: text_content.target_prompt_tokens
                     or 0,
                     AudioMetricKey.INPUT_TEXT.value: input_text,
+                    # Absolute anchors (recordings only). Chunk i arrived at
+                    # request_start_monotonic + audio_chunk_timestamps[i][0]/1000.
+                    "request_start_monotonic": t_start,
+                    "request_sent_monotonic": request_sent_monotonic,
                 },
             )
 

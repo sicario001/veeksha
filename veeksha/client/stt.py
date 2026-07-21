@@ -158,6 +158,18 @@ class STTStreamResult:
       when no such delta arrives before completion.
     - ``time_to_final_transcript``: from end-of-audio to the completion
       message.
+
+    Two raw per-event recordings back the pacing/cadence measurements (they
+    record stamps only; no drift arithmetic happens in the client):
+
+    - ``send_offsets_ms``: one entry per audio chunk actually sent, stamped
+      immediately before the socket send call, as a ms offset from
+      ``audio_started_at``. Entry 0 is 0.0 by construction: the first send
+      stamp *is* the anchor.
+    - ``transcript_delta_offsets_ms``: one entry per transcript delta
+      received, stamped on ``recv()`` return before parsing, as a ms offset
+      from ``audio_started_at``. Unlike ``transcript_snapshots`` (which is
+      deduplicated by content) this counts every wire event.
     """
 
     ttfc: Optional[float]
@@ -169,6 +181,17 @@ class STTStreamResult:
     transcript_snapshots: list[TranscriptSnapshotRow]
     chunk_count: int
     pcm_byte_count: int
+    send_offsets_ms: list[float]
+    transcript_delta_offsets_ms: list[float]
+    # Absolute ``time.monotonic()`` of the first audio byte on the wire (the
+    # instant ``send_offsets_ms`` are measured from), so a send offset can be
+    # made absolute and paired with the server's append-arrival stamp. ``None``
+    # if no audio was ever sent.
+    audio_started_monotonic: Optional[float]
+    # Absolute ``time.monotonic()`` of the first application frame the client
+    # sent (the session.update handshake) -- the C2 request-level send stamp,
+    # paired with the mock's ``received_at``.
+    request_sent_monotonic: Optional[float]
 
 
 class TranscriptSnapshotRecorder:
@@ -240,8 +263,17 @@ class _STTClientBase(BaseLLMClient):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def _open_session(self, ws) -> None:
-        """Complete the provider handshake before audio is sent."""
+    async def _open_session(self, ws, request_id: Optional[int] = None) -> float:
+        """Complete the provider handshake before audio is sent.
+
+        Returns the monotonic instant of the FIRST application frame sent (the
+        session.update) -- the C2 client-side "request started going out" stamp
+        that pairs with the mock's ``received_at`` (its first received frame).
+
+        ``request_id``, when given, is echoed into the session.update as
+        ``veeksha_request_id`` so the preflight mock can correlate this
+        connection's records; omitted entirely on real runs (no wire change).
+        """
 
     @abstractmethod
     def _encode_chunk(self, chunk: bytes | memoryview) -> str | bytes:
@@ -323,6 +355,7 @@ class _STTClientBase(BaseLLMClient):
         wire_messages: Optional[list[str | bytes]] = None,
         on_request_sent: Optional[Callable[[], None]] = None,
         on_request_dispatched: Optional[Callable[[], None]] = None,
+        request_id: Optional[int] = None,
     ) -> STTStreamResult:
         """Stream pre-decoded PCM16 to the provider and collect the transcript.
 
@@ -348,6 +381,9 @@ class _STTClientBase(BaseLLMClient):
         chunk_count = 0
         transcript_chunks: list[str] = []
         snapshots = TranscriptSnapshotRecorder()
+        send_offsets_ms: list[float] = []
+        transcript_delta_offsets_ms: list[float] = []
+        request_sent_monotonic: Optional[float] = None
 
         async with websockets.connect(
             self._ws_url,
@@ -355,17 +391,16 @@ class _STTClientBase(BaseLLMClient):
             ping_timeout=self._ws_ping_timeout_s,
             compression=self._ws_compression,
         ) as ws:
-            await self._open_session(ws)
+            # The handshake's session.update is the first frame the mock
+            # receives, so its send instant is the C2 request-level send stamp.
+            request_sent_monotonic = await self._open_session(ws, request_id)
             if on_request_dispatched is not None:
                 on_request_dispatched()
 
             async def _send() -> None:
                 nonlocal audio_end_at, audio_started_at
                 for byte_offset in range(0, len(pcm_bytes), self._ws_chunk_size):
-                    if audio_started_at is None:
-                        audio_started_at = time.monotonic()
-                        snapshots.mark_audio_started(audio_started_at)
-                    else:
+                    if audio_started_at is not None:
                         await self._maybe_pace_until(
                             audio_started_at
                             + byte_offset / BYTES_PER_SAMPLE / self._sample_rate
@@ -375,6 +410,18 @@ class _STTClientBase(BaseLLMClient):
                         message = wire_messages[byte_offset // self._ws_chunk_size]
                     else:
                         message = self._encode_chunk(pcm_bytes[byte_offset:chunk_end])
+                    # Stamp the moment this chunk was decided to be sent, i.e.
+                    # immediately before the socket call: stamping after it
+                    # would charge syscall/kernel time to pacing. The first
+                    # send stamp is the anchor, so its offset is 0.0.
+                    if audio_started_at is None:
+                        audio_started_at = time.monotonic()
+                        snapshots.mark_audio_started(audio_started_at)
+                        send_offsets_ms.append(0.0)
+                    else:
+                        send_offsets_ms.append(
+                            (time.monotonic() - audio_started_at) * 1000
+                        )
                     await ws.send(message)
                 if audio_started_at is not None:
                     await self._maybe_pace_until(
@@ -387,9 +434,18 @@ class _STTClientBase(BaseLLMClient):
             send_task = asyncio.ensure_future(_send())
             try:
                 while True:
-                    kind, text = self._parse_message(json.loads(await ws.recv()))
+                    raw = await ws.recv()
+                    # Stamp receipt BEFORE any json parsing: parse cost
+                    # charged to arrival shows up as server latency.
                     now = time.monotonic()
+                    kind, text = self._parse_message(json.loads(raw))
                     if kind == "delta":
+                        # Raw wire cadence: every delta, including ones whose
+                        # content the snapshot recorder dedupes away.
+                        if audio_started_at is not None:
+                            transcript_delta_offsets_ms.append(
+                                (now - audio_started_at) * 1000
+                            )
                         # TTFC counts only deltas whose own payload carries
                         # transcript text after cleaning; empty progress /
                         # keepalive deltas (e.g. Vajra's priming delta) and
@@ -475,6 +531,10 @@ class _STTClientBase(BaseLLMClient):
             transcript_snapshots=snapshots.snapshots,
             chunk_count=chunk_count,
             pcm_byte_count=len(pcm_bytes),
+            send_offsets_ms=send_offsets_ms,
+            transcript_delta_offsets_ms=transcript_delta_offsets_ms,
+            audio_started_monotonic=audio_started_at,
+            request_sent_monotonic=request_sent_monotonic,
         )
 
     # ------------------------------------------------------------------
@@ -589,6 +649,12 @@ class _STTClientBase(BaseLLMClient):
 
         t_start = time.monotonic()
 
+        # Preflight correlation: the driver tags the request with an id; the
+        # handshake echoes it so the mock can key its records by it. Absent on
+        # real runs (no metadata key -> no wire change).
+        pfid = request.metadata.get("preflight_pfid")
+        request_id = int(pfid) if pfid is not None else None
+
         try:
             async with asyncio.timeout(self._request_timeout):
                 stream_result = await self._stream(
@@ -596,6 +662,7 @@ class _STTClientBase(BaseLLMClient):
                     wire_messages,
                     on_request_sent=fire_sent_once,
                     on_request_dispatched=fire_dispatched_once,
+                    request_id=request_id,
                 )
         except TimeoutError:
             error_code = 408
@@ -655,6 +722,24 @@ class _STTClientBase(BaseLLMClient):
                 "partial_transcript": stream_result.partial_transcript,
                 "final_transcript": stream_result.final_transcript,
                 "transcript_snapshots": stream_result.transcript_snapshots,
+                # Raw per-event stamps (recorded, never scored, in the client).
+                "send_offsets_ms": [
+                    round(offset, 3) for offset in stream_result.send_offsets_ms
+                ],
+                "transcript_delta_offsets_ms": [
+                    round(offset, 3)
+                    for offset in stream_result.transcript_delta_offsets_ms
+                ],
+                # Absolute anchors (recordings only). request_start_monotonic is
+                # t_start; request_sent_monotonic is the handshake send (the C2
+                # request-level stamp, paired with the mock's received_at);
+                # audio_started_monotonic is the absolute counterpart of the
+                # send_offsets_ms anchor, so chunk i went out at
+                # audio_started_monotonic + send_offsets_ms[i]/1000 (the separate
+                # per-append C2 stamp).
+                "request_start_monotonic": t_start,
+                "request_sent_monotonic": stream_result.request_sent_monotonic,
+                "audio_started_monotonic": stream_result.audio_started_monotonic,
             }
 
             # Ground truth and dataset metadata are guaranteed by the trace generator.
@@ -688,12 +773,18 @@ class VllmRealtimeSTTClient(_STTClientBase):
 
     ws_path = "/v1/realtime"
 
-    async def _open_session(self, ws) -> None:
+    async def _open_session(self, ws, request_id: Optional[int] = None) -> float:
         msg = json.loads(await ws.recv())
         if msg.get("type") != "session.created":
             raise RuntimeError(f"Expected session.created, got: {msg}")
-        await ws.send(json.dumps({"type": "session.update", "model": self._model}))
+        update = {"type": "session.update", "model": self._model}
+        if request_id is not None:
+            update["veeksha_request_id"] = request_id
+        # Stamp immediately before the first application frame leaves.
+        request_sent = time.monotonic()
+        await ws.send(json.dumps(update))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+        return request_sent
 
     def _encode_chunk(self, chunk: bytes | memoryview) -> str:
         return json.dumps(
@@ -729,21 +820,23 @@ class VajraOpenAIRealtimeSTTClient(_STTClientBase):
 
     ws_path = "/openai/v1/realtime?intent=transcription"
 
-    async def _open_session(self, ws) -> None:
+    async def _open_session(self, ws, request_id: Optional[int] = None) -> float:
         msg = json.loads(await ws.recv())
         if msg.get("type") != "transcription_session.created":
             raise RuntimeError(f"Expected transcription_session.created, got: {msg}")
         # Configure the session; unlike vllm_realtime, do NOT commit here — a
         # commit before any audio would finalize an empty transcript.
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "transcription_session.update",
-                    "input_audio_format": "pcm16",
-                    "input_audio_transcription": {"model": self._model},
-                }
-            )
-        )
+        update = {
+            "type": "transcription_session.update",
+            "input_audio_format": "pcm16",
+            "input_audio_transcription": {"model": self._model},
+        }
+        if request_id is not None:
+            update["veeksha_request_id"] = request_id
+        # Stamp immediately before the first application frame leaves.
+        request_sent = time.monotonic()
+        await ws.send(json.dumps(update))
+        return request_sent
 
     def _encode_chunk(self, chunk: bytes | memoryview) -> str:
         return json.dumps(
