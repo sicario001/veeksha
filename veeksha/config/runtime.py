@@ -38,3 +38,12 @@ class RuntimeConfig:
         help="Pre-generate all sessions before starting benchmark timer. "
         "Requires max_sessions > 0.",
     )
+    main_loop: str = field(
+        "python",
+        help=(
+            "Benchmark main-loop implementation: python | native. native runs the "
+            "C++ scheduler/transport loop and falls back to the Python "
+            "loop with a warning when the workload is ineligible or the "
+            "veeksha_native extension is not built."
+        ),
+    )

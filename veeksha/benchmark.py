@@ -226,7 +226,7 @@ def _run_benchmark(
         )
 
     loop = create_main_loop(
-        "python",
+        benchmark_config.runtime.main_loop,
         MainLoopConfig(
             runtime=benchmark_config.runtime,
             traffic=benchmark_config.traffic_scheduler,

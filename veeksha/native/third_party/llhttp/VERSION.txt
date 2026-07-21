@@ -1,0 +1,14 @@
+llhttp v9.4.2 (MIT), vendored 2026-07-21.
+
+Source: release tarball of https://github.com/nodejs/llhttp
+        tag release/v9.4.2 (the "release" branch carries the generated
+        single-file C sources; the main branch requires TypeScript codegen).
+Files:  llhttp.h (from include/), api.c, http.c, llhttp.c (from src/),
+        LICENSE. Unmodified.
+
+Role in veeksha_native: llhttp owns HTTP/1.1 response FRAMING only — status
+line, headers, chunked transfer decoding, message completion (including the
+llhttp_finish on-EOF path for Connection: close bodies). The SSE `data:` line
+framing, chat delta.content extraction, JSON escape/unescape, and the
+WebSocket client codec remain in-tree (veeksha/native/src/transport.h) by
+design: they are benchmark-payload concerns, not HTTP framing.
