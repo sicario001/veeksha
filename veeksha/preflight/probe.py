@@ -1,0 +1,325 @@
+"""Probes that measure Veeksha's timing preflight at a given concurrency.
+
+`probe_receive_drift` drives the REAL client/dispatch/completion pipeline against
+the mock engine and reports how faithfully Veeksha recorded the (known) chunk
+cadence. `probe_pacing` measures whether this system can sustain accurate
+real-time send pacing (as used for streaming-audio / ASR benchmarks) at a given
+concurrency — a pure asyncio scheduling probe.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import time
+from queue import Queue
+from typing import Dict, List, Optional
+
+from veeksha.config.client import OpenAIChatCompletionsClientConfig
+from veeksha.config.traffic import ConcurrentTrafficConfig
+from veeksha.core.context import WorkerContext
+from veeksha.core.request import Request
+from veeksha.core.request_content import TextChannelRequestContent
+from veeksha.core.requested_output import RequestedOutputSpec, TextOutputSpec
+from veeksha.core.seeding import SeedManager
+from veeksha.core.session import Session
+from veeksha.core.session_graph import SessionGraph, SessionNode, add_node
+from veeksha.core.tokenizer import TokenizerHandle, TokenizerProvider
+from veeksha.traffic.concurrent import ConcurrentTrafficScheduler
+from veeksha.types import ChannelModality
+from veeksha.workers.client_runner import ClientRunnerManager
+from veeksha.workers.completion import CompletionWorker
+from veeksha.workers.dispatch import DispatchWorker
+
+
+def _whitespace_tokenizer_provider() -> TokenizerProvider:
+    """A model-free tokenizer so the preflight needs no download (token counts
+    are irrelevant to timing)."""
+    handle = TokenizerHandle(
+        count_tokens=lambda t: len(str(t).split()),
+        decode=lambda ids: " ".join("x" for _ in ids),
+        encode=lambda t: list(range(len(str(t).split()))),
+        get_vocab=lambda: [0],
+    )
+    return TokenizerProvider({ChannelModality.TEXT: handle}, model_name="preflight")
+
+
+def _pct(xs: List[float], p: float) -> float:
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(round(p / 100.0 * (len(xs) - 1))))]
+
+
+def _wrap_session(request: Request, delay_s: float = 0.0) -> Session:
+    """Wrap one workload-built request in a single-node session.
+
+    The request itself comes from the workload, so the Python and native paths
+    send the identical object; this only supplies the session scaffolding the
+    Python scheduler needs and native does not. ``delay_s`` is the request's
+    scheduled arrival offset — the Python equivalent of the native engine's
+    per-request dispatch offset.
+    """
+    graph = SessionGraph()
+    add_node(graph, SessionNode(id=0, wait_after_ready=delay_s))
+    return Session(id=request.id, session_graph=graph, requests={0: request})
+
+
+class _CollectEvaluator:
+    """Minimal evaluator satisfying the worker interface; stores results."""
+
+    def __init__(self):
+        self.results = []
+        self._lock = threading.Lock()
+
+    def register_request(
+        self, request_id, session_id, dispatched_at, channels, requested_output
+    ):
+        return
+
+    def record_request_completed(
+        self, request_id, session_id, completed_at, response, error=None
+    ):
+        with self._lock:
+            self.results.append(response)
+
+
+def score_receive_results(results, num_chunks: int, chunk_dt: float) -> Dict:
+    """Score per-chunk receive fidelity from RequestResults.
+
+    Both the Python pipeline and the native transport hand back
+    ``RequestResult``s carrying ``inter_chunk_times``, so scoring them with ONE
+    function is what keeps the two comparable — there is no second copy of the
+    formula, the windowing, or the success filter to drift out of step.
+    """
+    lo = int(0.10 * len(results))
+    hi = int(0.95 * len(results)) or len(results)
+    window = results[lo:hi]
+
+    ivl_err: List[float] = []
+    stretch: List[float] = []
+    ttfc: List[float] = []
+    n_success = 0
+    # steady-state ideal: first-chunk -> last-chunk (excludes connect/prefill
+    # noise, which is a separate concern from streaming-timing preflight).
+    ideal_span = (num_chunks - 1) * chunk_dt
+    for rr in window:
+        if not getattr(rr, "success", False):
+            continue
+        n_success += 1
+        ch = rr.channels.get(ChannelModality.TEXT)
+        if ch is None:
+            continue
+        ict = ch.metrics.get("inter_chunk_times") or []
+        if len(ict) < 2:
+            continue
+        ttfc.append(ict[0] * 1000.0)
+        for d in ict[1:]:
+            ivl_err.append(abs(d - chunk_dt) * 1000.0)
+        span = sum(ict[1:])  # first chunk -> last chunk
+        stretch.append(span / ideal_span if ideal_span > 0 else float("nan"))
+    return {
+        "ivl_err": ivl_err,
+        "stretch": stretch,
+        "ttfc": ttfc,
+        "window": window,
+        "n_success": n_success,
+    }
+
+
+def _drive_sessions(
+    client,
+    sessions: List,
+    n_expected: int,
+    concurrency: int,
+    config,
+    request_duration_s: float,
+):
+    """Run `sessions` through the REAL pipeline; return (results, wall_seconds).
+
+    The one place the preflight builds a pipeline. ``veeksha.benchmark`` builds
+    the same prefetch -> dispatch -> client-worker -> completion arrangement for
+    EVERY modality, so driving any client any other way would certify a path no
+    benchmark takes — and would miss whatever the scheduler and its queues cost
+    at concurrency. Text, TTS, ASR and the dispatch checks all come through here;
+    the only axis that varies is Python versus native.
+    """
+    sched = ConcurrentTrafficScheduler(
+        ConcurrentTrafficConfig(
+            target_concurrent_sessions=concurrency,
+            rampup_seconds=0,
+            cancel_session_on_failure=False,
+        ),
+        SeedManager(0),
+    )
+    sched.reset_reference_time()
+
+    evaluator = _CollectEvaluator()
+    client_queues = [Queue() for _ in range(config.num_client_threads)]
+    output_queue: Queue = Queue()
+    stop_event = threading.Event()
+
+    client_runner = ClientRunnerManager(
+        client=client,
+        input_queues=client_queues,
+        output_queue=output_queue,
+        stop_event=stop_event,
+        traffic_scheduler=sched,
+    )
+    dispatchers = [
+        DispatchWorker(
+            sched,
+            client_queues,
+            evaluator,
+            WorkerContext(worker_id=i, stop_event=stop_event),
+        )
+        for i in range(config.num_dispatcher_threads)
+    ]
+    completers = [
+        CompletionWorker(
+            output_queue,
+            sched,
+            evaluator,
+            WorkerContext(worker_id=i, stop_event=stop_event),
+        )
+        for i in range(config.num_completion_threads)
+    ]
+    threads = [
+        threading.Thread(target=w.run, daemon=True) for w in (*dispatchers, *completers)
+    ]
+
+    client_runner.start()
+    for t in threads:
+        t.start()
+
+    t0 = time.monotonic()
+    for session in sessions:
+        sched.schedule_session(session)
+
+    deadline = t0 + 60.0 + n_expected * request_duration_s / max(1, concurrency)
+    while len(evaluator.results) < n_expected and time.monotonic() < deadline:
+        time.sleep(0.02)
+    wall = time.monotonic() - t0
+
+    stop_event.set()
+    client_runner.stop()
+    for _ in range(config.num_completion_threads):
+        output_queue.put(None)
+    for t in threads:
+        t.join(timeout=2.0)
+    client_runner.wait(timeout=3.0)
+    return list(evaluator.results), wall
+
+
+def run_pipeline(
+    client,
+    requests: List,
+    concurrency: int,
+    config,
+    request_duration_s: float,
+    dispatch_offsets_s: Optional[List[float]] = None,
+):
+    """One request per session, optionally on an arrival schedule."""
+    sessions = [
+        _wrap_session(r, dispatch_offsets_s[i] if dispatch_offsets_s else 0.0)
+        for i, r in enumerate(requests)
+    ]
+    return _drive_sessions(
+        client, sessions, len(requests), concurrency, config, request_duration_s
+    )
+
+
+def _cpu(n: int) -> int:
+    acc = 0
+    for k in range(n):
+        acc += k * k
+    return acc
+
+
+async def _paced_send(k_chunks: int, chunk_dt: float, cpu: int):
+    """Absolute-deadline pacing (the veeksha stt.py design).
+
+    Returns (total_send_time, per_chunk_send_drift_ms) where each drift is the
+    signed lateness of that chunk's dispatch vs its schedule — the per-dispatch
+    precision that ASR interactivity depends on.
+    """
+    start = time.monotonic()
+    per_chunk_drift_ms = []
+    for i in range(k_chunks):
+        _cpu(cpu)
+        target = start + (i + 1) * chunk_dt
+        delay = target - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        # how late did this chunk actually go out vs its scheduled slot?
+        per_chunk_drift_ms.append((time.monotonic() - target) * 1000.0)
+    return time.monotonic() - start, per_chunk_drift_ms
+
+
+def probe_pacing(
+    concurrency: int, clip_s: float, chunk_ms: float, cpu: int = 500
+) -> Dict[str, float]:
+    """Measure real-time send-pacing precision across `concurrency` senders.
+
+    Models the ASR realtime-audio pacing loop: a clip of `clip_s` sent in
+    `chunk_ms` slots should take `clip_s`, with each chunk dispatched on time.
+    Returns both the aggregate stretch (p99 of total/ideal) AND the per-chunk
+    send-drift (p99/max of |actual - scheduled| per dispatch), the granularity
+    that interactivity is sensitive to.
+    """
+    chunk_dt = chunk_ms / 1000.0
+    k = max(1, int(round(clip_s / chunk_dt)))
+
+    async def _run():
+        tasks = [
+            asyncio.create_task(_paced_send(k, chunk_dt, cpu))
+            for _ in range(concurrency)
+        ]
+        return await asyncio.gather(*tasks)
+
+    results = asyncio.run(_run())
+    ratios = [total / clip_s for total, _ in results]
+    per_chunk_abs = [abs(d) for _, drifts in results for d in drifts]
+    return {
+        "stretch_p99": _pct(ratios, 99),
+        "send_drift_p99_ms": _pct(per_chunk_abs, 99),
+        "send_drift_max_ms": max(per_chunk_abs) if per_chunk_abs else float("nan"),
+    }
+
+
+def run_chain_pipeline(
+    client,
+    requests: List,
+    turns: int,
+    think_s: float,
+    concurrency: int,
+    config,
+    request_duration_s: float,
+):
+    """Drive multi-turn conversations through the REAL pipeline.
+
+    Each conversation is one session whose turns are chained by history edges
+    with ``think_s`` between them, which is how a conversational benchmark is
+    actually shaped — so the scheduler, its queues and the completion workers
+    are all in the path, exactly as they are in a real run.
+    """
+    from veeksha.core.session_graph import SessionEdge, add_edge
+
+    sessions = []
+    for chain_start in range(0, len(requests), turns):
+        chain = requests[chain_start : chain_start + turns]
+        graph = SessionGraph()
+        by_node = {}
+        for k, request in enumerate(chain):
+            add_node(graph, SessionNode(id=k, wait_after_ready=think_s if k else 0.0))
+            if k:
+                add_edge(graph, SessionEdge(src=k - 1, dst=k, is_history_parent=True))
+            by_node[k] = request
+        sessions.append(
+            Session(id=chain_start // turns, session_graph=graph, requests=by_node)
+        )
+
+    results, _ = _drive_sessions(
+        client, sessions, len(requests), concurrency, config, request_duration_s
+    )
+    return results

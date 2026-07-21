@@ -25,6 +25,7 @@ from veeksha.cli.base import VeekshaCommand
 from veeksha.cli.benchmarks import run_cli as run_benchmark
 from veeksha.config.benchmark import BenchmarkConfig
 from veeksha.config.capacity_search import CapacitySearchConfig
+from veeksha.config.preflight import PreflightCheckConfig
 from veeksha.microbench.config import (
     DecodeMicrobenchmarkConfig,
     PrefillMicrobenchmarkConfig,
@@ -34,6 +35,7 @@ from veeksha.microbench.decode import run_decode
 from veeksha.microbench.diff import DiffConfig, run_diff
 from veeksha.microbench.prefill import run_prefill
 from veeksha.microbench.stress import run_stress
+from veeksha.preflight.runner import run_preflight_cli
 from veeksha.version import __version__
 
 _RUNNERS = {
@@ -43,6 +45,7 @@ _RUNNERS = {
     DecodeMicrobenchmarkConfig: lambda configs: [run_decode(c) for c in configs],
     StressMicrobenchmarkConfig: lambda configs: [run_stress(c) for c in configs],
     DiffConfig: lambda configs: [run_diff(c) for c in configs],
+    PreflightCheckConfig: run_preflight_cli,
 }
 
 _VERSION_FLAGS = {"--version", "-V"}

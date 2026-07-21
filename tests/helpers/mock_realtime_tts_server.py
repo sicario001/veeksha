@@ -25,7 +25,11 @@ from typing import Optional
 
 import websockets
 
-from veeksha.preflight.sharded_server import ShardedLoopServer, ShardedTelemetry
+from veeksha.preflight.sharded_server import (
+    PhaseSpreader,
+    ShardedLoopServer,
+    ShardedTelemetry,
+)
 
 
 class MockRealtimeTTSServer(ShardedLoopServer):
@@ -46,6 +50,7 @@ class MockRealtimeTTSServer(ShardedLoopServer):
         self.delta_dt = delta_dt
         self.sample_rate = sample_rate
         self._lateness = ShardedTelemetry()
+        self._phase = PhaseSpreader()
         # Pre-serialize every repeated message ONCE: the audio delta is identical
         # for every chunk of every connection, so json.dumps-per-chunk is pure
         # wasted CPU on the emit loop (and shows up as server jitter). Do it here.
@@ -79,7 +84,7 @@ class MockRealtimeTTSServer(ShardedLoopServer):
 
     async def _emit_audio(self, ws) -> None:
         await ws.send(json.dumps({"type": "response.created"}))
-        start = time.monotonic()
+        start = time.monotonic() + self._phase.next_phase(self.delta_dt)
         for i in range(self.num_chunks):
             scheduled = start + self.first_delta_delay + i * self.delta_dt
             now = time.monotonic()
