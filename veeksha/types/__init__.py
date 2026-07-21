@@ -36,6 +36,8 @@ class TraceFlavorType(BaseIntEnum):
     RAG = 3
     REQUEST_LOG = 4
     UNTIMED_CONTENT_MULTI_TURN = 5
+    SEED_TTS_TEXT = 7  # TTS input-text trace
+    AUDIO = 8  # ASR audio-manifest trace
 
 
 class ChannelModality(BaseIntEnum):
@@ -43,6 +45,13 @@ class ChannelModality(BaseIntEnum):
     IMAGE = 2
     AUDIO = 3
     VIDEO = 4
+
+
+class AudioTask(BaseIntEnum):
+    """The workload an AUDIO channel represents (tags ChannelResponse.metrics)."""
+
+    TTS = 1  # text -> audio
+    STT = 2  # audio -> text (ASR)
 
 
 class SessionGraphType(BaseIntEnum):
@@ -62,6 +71,9 @@ class ClientType(BaseIntEnum):
     OPENAI_CHAT_COMPLETIONS = 1
     OPENAI_COMPLETIONS = 2
     OPENAI_ROUTER = 3
+    TTS = 4
+    REALTIME_TTS = 5
+    STT = 6
 
 
 # ----- Server -----

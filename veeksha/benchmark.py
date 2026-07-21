@@ -202,10 +202,16 @@ def _run_benchmark(
 
     # get session generator
     model_name = benchmark_config.client.model
-    tokenizer_provider = TokenizerProvider(
-        {ChannelModality.TEXT: build_hf_tokenizer_handle_from_model(model_name)},
-        model_name=model_name,
-    )
+    # Audio clients (TTS/STT/realtime) supply their own tokenizer (a word-split
+    # provider) since their models ship no HuggingFace tokenizer; text clients use
+    # the HF tokenizer for the model.
+    if hasattr(benchmark_config.client, "build_tokenizer_provider"):
+        tokenizer_provider = benchmark_config.client.build_tokenizer_provider()
+    else:
+        tokenizer_provider = TokenizerProvider(
+            {ChannelModality.TEXT: build_hf_tokenizer_handle_from_model(model_name)},
+            model_name=model_name,
+        )
     append_min_tokens_instruction = False
     if (
         hasattr(benchmark_config.client, "use_min_tokens_prompt_fallback")

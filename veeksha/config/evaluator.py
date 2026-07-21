@@ -186,8 +186,9 @@ class PerformanceEvaluatorConfig(BaseEvaluatorConfig):
         default_factory=ImageChannelPerformanceConfig,
         help="Image channel performance configuration",
     )
-    audio_channel: Optional[AudioChannelPerformanceConfig] = field(
-        None, help="Audio channel performance configuration"
+    audio_channel: AudioChannelPerformanceConfig = field(
+        default_factory=AudioChannelPerformanceConfig,
+        help="Audio channel performance configuration",
     )
     video_channel: Optional[VideoChannelPerformanceConfig] = field(
         None, help="Video channel performance configuration"

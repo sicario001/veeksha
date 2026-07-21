@@ -74,6 +74,24 @@ def build_hf_tokenizer_handle_from_model(model: str) -> TokenizerHandle[str]:
     return build_hf_tokenizer_handle(tokenizer)
 
 
+def build_word_split_tokenizer_provider(model_name: str) -> "TokenizerProvider":
+    """Build a TokenizerProvider backed by a simple whitespace word-split tokenizer.
+
+    Used by TTS/STT-style clients whose models do not ship a HuggingFace
+    tokenizer; tokens are approximated as whitespace-delimited words. Needs no
+    model download and no ``transformers`` at call time.
+    """
+    handle: TokenizerHandle[str] = TokenizerHandle(
+        count_tokens=lambda text: len(text.split()),
+        decode=lambda ids: " ".join(str(i) for i in ids),
+        encode=lambda text: list(range(len(text.split()))),
+    )
+    return TokenizerProvider(
+        {ChannelModality.TEXT: handle},
+        model_name=model_name,
+    )
+
+
 def gen_prompt_from_corpus(
     num_tokens: int,
     pretokenized_lines: Iterable[Sequence[int]],

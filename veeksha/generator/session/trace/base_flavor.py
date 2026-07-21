@@ -83,6 +83,13 @@ class TraceFlavorGeneratorBase:
     def wrap(self) -> pd.DataFrame:
         """Wrap the trace for a new epoch."""
 
+    def _wrap_shuffled(self) -> pd.DataFrame:
+        """Shared epoch wrap: re-key session ids past the max, then shuffle."""
+        df = self.trace_df.copy()
+        max_sid = int(df["session_id"].max()) if not df.empty else 0
+        df["session_id"] = df["session_id"] + max_sid + 1
+        return self._shuffle_sessions(df)
+
     def get_warmup_sessions(self) -> List[Session]:
         """Return warmup sessions. Default empty, override for RAG."""
         return []
