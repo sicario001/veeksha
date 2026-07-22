@@ -289,6 +289,13 @@ class RealtimeTTSClient(BaseLLMClient):
                 if sleep_s > 0:
                     await asyncio.sleep(sleep_s)
                 await ws.send(self._protocol.conversation_item_create_json(seg.text))
+                # If we have information about the scheduler_ready_at, dispatched_at, client_picked_up_at for this request,
+                # we should make sure that t_cs_1 is close to them
+                # time.monotonic() for segment i is t_cs_i (client requent sent time i)
+                # send t_cs_i along with the request
+                # At the server, we should validate that server receive time i i.e t_sr_i is close to
+                # t_cs_i
+                # We should also make sure we are t_cs_i is consistent with the pacing i.e close to deadline
                 text_delta_ts.append([(time.monotonic() - t_start) * 1000, seg.n_chars])
             input_complete_offset = (time.monotonic() - t_start) * 1000
             await ws.send(self._protocol.response_create_json())
@@ -300,6 +307,14 @@ class RealtimeTTSClient(BaseLLMClient):
                 raw = await ws.recv()
                 # Stamp receipt BEFORE any json/base64 decode work.
                 offset_ms = (time.monotonic() - t_start) * 1000
+                # client response receive time i i.e t_cr_i
+                # The mock server should send server response sent time i.e t_ss_i
+                # The client/preflight validation should validate t_cr_i and t_ss_i are close
+                # The server should also validate the time interval between t_ss_{i+1} - t_ss_{i} matches the
+                # precofigured time for sending a chunck of the audio
+                # The server should also validate the time interval betwen the first response t_ss_1 and the first segment
+                # receive time i.e t_sr_1 is close to the fixed precofigured value ttfc
+                # The above validation can be done on the client side as well i.e t_cr_1 - t_cs should be close to the configured ttfc
                 try:
                     event = json.loads(raw)
                 except (json.JSONDecodeError, TypeError, ValueError):
@@ -371,6 +386,7 @@ class RealtimeTTSClient(BaseLLMClient):
             )
             logger.warning("Realtime TTS error: (%s) %s", error_code, error_msg)
 
+        # request completed time. Validate that this is close to the t_ss_k and t_cr_k (i.e time for last chunk)
         completed_at = time.monotonic()
         total_latency_ms = (completed_at - t_start) * 1000
         success = error_code is None and error_msg is None

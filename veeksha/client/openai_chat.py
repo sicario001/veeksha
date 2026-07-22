@@ -391,6 +391,12 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
             client = self._get_client()
             t_start = time.monotonic()
             most_recent_token_time = t_start
+            # If we have information about the scheduler_ready_at, dispatched_at, client_picked_up_at for this request,
+            # we should make sure that t_cs is close to them
+            # client request sent time = t_cs
+            # t_cs should also be part of the request to the mock server
+            # The mock server received request at t_sr
+            # Our preflight validation should ensure that t_cs and t_sr are close at validated at the mock server
             async with client.stream(
                 "POST",
                 self.chat_address,
@@ -406,6 +412,12 @@ class OpenAIChatCompletionsClient(OpenAIBaseClient):
                 sent_notified = False
                 async for data in self._process_stream(response):
                     receive_time = time.monotonic()
+                    # client response receive time = t_cr_1
+                    # for preflight validation, the response should also contain timing for when server sent response = t_ss_1
+                    # Our preflight validation should ensure that t_cr_1 and t_ss_1 are close
+                    # Our mock server has fixed configs that determine when it will send a response. We should validate that t_ss_1 - t_sr (checked at the mock server)
+                    # matches that. (ttft). The response is streaming so we should validate the timings for every response received. i.e subsequent
+                    # t_ss_i values and t_cr_i values. i.e t_ss_{i+1} - t_ss_{i}nis equal to the configured tbt/tpot (can check at the mock server) and t_ss_i and t_cr_i are close
                     if "error" in data:
                         err = data.get("error") or {}
                         error_msg = err.get("message", "Unknown error")

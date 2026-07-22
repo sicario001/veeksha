@@ -375,6 +375,12 @@ class _STTClientBase(BaseLLMClient):
                         message = wire_messages[byte_offset // self._ws_chunk_size]
                     else:
                         message = self._encode_chunk(pcm_bytes[byte_offset:chunk_end])
+                    # If we have information about the scheduler_ready_at, dispatched_at, client_picked_up_at for this request,
+                    # we should make sure that t_cs_1 is close to them
+                    # client audio request segment i sent time is t_cs_i
+                    # This should be sent along with the request to the mock server for preflight validation
+                    # The mock server should validate that request receive time at server i.e t_sr_i is close to t_cs_i 
+                    # We should also make sure we are t_cs_i is consistent with the pacing i.e close to value inside _maybe_pace_until
                     await ws.send(message)
                 if audio_started_at is not None:
                     await self._maybe_pace_until(
@@ -389,6 +395,15 @@ class _STTClientBase(BaseLLMClient):
                 while True:
                     kind, text = self._parse_message(json.loads(await ws.recv()))
                     now = time.monotonic()
+                    # client receives segment i of the response at time t_cr_i
+                    # The mock server should send time response segment i sent i.e t_ss_i along with the repsonse
+                    # The client/preflight validation should validate t_cr_i and t_ss_i are close
+                    # The server should also validate the time interval between t_ss_{i+1} - t_ss_{i} matches the
+                    # precofigured time for sending a segment of the text by the mock server
+                    # The server should also validate the time interval betwen the first response t_ss_1 and the first audio segment
+                    # receive time i.e t_sr_1 is close to the fixed precofigured value ttfc
+                    # The above validation can be done on the client side as well i.e t_cr_1 - t_cs should be close to the configured ttfc
+
                     if kind == "delta":
                         # TTFC counts only deltas whose own payload carries
                         # transcript text after cleaning; empty progress /

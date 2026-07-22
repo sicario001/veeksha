@@ -118,12 +118,23 @@ class OpenAICompletionsClient(OpenAIBaseClient):
         completion_text = ""
         logprobs: Any = None
 
-        start_time = time.monotonic()
+        # If we have information about the scheduler_ready_at, dispatched_at, client_picked_up_at for this request,
+        # we should make sure that t_cs is close to them
+        # client request sent time = t_cs
+        # t_cs should also be part of the request to the mock server
+        # The mock server received request at t_sr
+        # Our preflight validation should ensure that t_cs and t_sr are close at validated at the mock server        start_time = time.monotonic()
         try:
             client = self._get_client()
             response = await client.post(
                 self.completions_address, json=body, headers=headers, timeout=timeout
             )
+            # client response receive time = t_cr
+            # for preflight validation, the response should also contain timing for when server sent response = t_ss
+            # Our preflight validation should ensure that t_cr and t_ss are close
+            # Our mock server has fixed configs that determine when it will send a response. We should validate that t_ss - t_sr (checked at the mock server)
+            # matches time to process the request i.e some preconfigured value for the server. could be ttft + num_tokens*tpot
+            # depends on how we configure the mock server. 
             response.raise_for_status()
             if on_request_dispatched is not None:
                 on_request_dispatched()

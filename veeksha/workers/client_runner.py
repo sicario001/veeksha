@@ -113,6 +113,8 @@ class ClientWorker:
                 None, tracker.wait_for_turn, request.dispatch_ticket
             )
 
+        # For this request, there are other fields like scheduler_ready_at and dispatched_at
+        # As part of preflight validation, we should make sure that dispatched_at and client_picked_up_at are close
         client_picked_up_at: float = time.monotonic()
 
         ordering = tracker.ordering if tracker is not None else "dispatch"

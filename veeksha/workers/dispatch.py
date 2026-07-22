@@ -74,6 +74,9 @@ class DispatchWorker:
                 continue
 
             request, session_id, session_size = result
+            # Should scheduler_ready_at really be time.monotonic()? SHould this not be the ready_at field in ScheduledItem
+            # wait_for_ready doesn't return that right now, but I think it should
+            # Then we should have another preflight validation check that checks scheduler_ready_at and dispatched_at are close
             scheduler_ready_at = time.monotonic()
             dispatched_at = time.monotonic()
 

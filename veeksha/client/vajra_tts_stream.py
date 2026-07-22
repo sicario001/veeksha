@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# Very similar preflight validations as realtime_tts
 class VajraTTSStreamProtocol:
     """Vajra streaming-speech wire contract used by the benchmark client."""
 
